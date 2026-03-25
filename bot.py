@@ -473,9 +473,6 @@ APP = None
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    if str(update.effective_user.id) != str(CHAT_ID):
-        return
- 
     text   = update.message.text.strip()
     symbol = text.upper().replace(" ", "").lstrip("/")
  
