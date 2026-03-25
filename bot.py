@@ -142,7 +142,7 @@ def get_yahoo_data(symbol, period="1y"):
     yf_range = range_map.get(period, period)
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=" + yf_range
     try:
-        r      = requests.get(url, headers=headers, timeout=15)
+        r      = requests.get(url, headers=headers, timeout=8)
         data   = r.json()
         result = data.get("chart", {}).get("result", [])
         if not result:
@@ -161,7 +161,7 @@ def get_ticker_info(symbol):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/" + symbol + "?modules=assetProfile,price"
     try:
-        r      = requests.get(url, headers=headers, timeout=10)
+        r      = requests.get(url, headers=headers, timeout=7)
         data   = r.json()
         result = data.get("quoteSummary", {}).get("result", [])
         if not result:
@@ -183,7 +183,7 @@ def get_ticker_info(symbol):
 def get_dolar_ar():
     """Fetch USD types from dolarito.ar public API."""
     try:
-        r    = requests.get("https://dolarito.ar/api/frontend/history/1", timeout=10,
+        r    = requests.get("https://dolarito.ar/api/frontend/history/1", timeout=7,
                             headers={"User-Agent": "Mozilla/5.0"})
         data = r.json()
         result = {}
@@ -243,7 +243,7 @@ def get_bono_price(ticker):
     # Source 1: PPI (portfoliopersonal.com) — public page, no auth needed
     try:
         url = "https://www.portfoliopersonal.com/Cotizaciones/Bonos"
-        r   = requests.get(url, headers=headers, timeout=15)
+        r   = requests.get(url, headers=headers, timeout=8)
         if r.status_code == 200:
             import re as _re
             # Pattern: ticker in brackets like [AL30] followed by price and variation
@@ -336,7 +336,7 @@ def get_ar_stock_price(ticker):
     # Fallback Ambito
     try:
         url = "https://mercados.ambito.com/acciones/" + ticker + "/info"
-        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r   = requests.get(url, timeout=7, headers={"User-Agent": "Mozilla/5.0"})
         data = r.json()
         price  = data.get("ultimoPrecio") or data.get("ultimo")
         change = data.get("variacion") or 0
@@ -414,7 +414,7 @@ def ask_claude(prompt, max_tokens=800):
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=30,
+            timeout=20,
         )
         data = r.json()
         return data.get("content", [{}])[0].get("text", "").strip()
@@ -794,7 +794,7 @@ def fetch_market(symbols):
 def fetch_crypto():
     try:
         ids  = ",".join(CRYPTO_IDS.values())
-        r    = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=" + ids + "&vs_currencies=usd&include_24hr_change=true", timeout=10)
+        r    = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=" + ids + "&vs_currencies=usd&include_24hr_change=true", timeout=7)
         data = r.json()
         return {name: {"price": data[cid]["usd"], "change": data[cid].get("usd_24h_change", 0)} for name, cid in CRYPTO_IDS.items() if cid in data}
     except Exception as e:
@@ -805,7 +805,7 @@ def fetch_news(query, count=4):
     if not NEWS_API_KEY:
         return []
     try:
-        r = requests.get("https://newsapi.org/v2/everything?q=" + query + "&language=en&sortBy=publishedAt&pageSize=" + str(count) + "&apiKey=" + NEWS_API_KEY, timeout=10)
+        r = requests.get("https://newsapi.org/v2/everything?q=" + query + "&language=en&sortBy=publishedAt&pageSize=" + str(count) + "&apiKey=" + NEWS_API_KEY, timeout=7)
         return [a["title"] for a in r.json().get("articles", []) if a.get("title")]
     except Exception:
         return []
@@ -1030,20 +1030,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Analizando tu consulta...")
         import asyncio
         loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, answer_question, text)
-        if result:
-            await update.message.reply_text(result, disable_web_page_preview=True)
-        else:
-            await update.message.reply_text("No pude generar un analisis. Intenta de nuevo.")
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, answer_question, text),
+                timeout=40.0
+            )
+            if result:
+                await update.message.reply_text(result, disable_web_page_preview=True)
+            else:
+                await update.message.reply_text("No pude generar un analisis. Intenta de nuevo.")
+        except asyncio.TimeoutError:
+            await update.message.reply_text("La consulta tardo demasiado. Intenta de nuevo.")
         return
 
     symbol = text.upper().replace(" ", "").lstrip("/")
     symbol = TICKER_ALIASES.get(symbol, symbol)
     await update.message.reply_text("Analizando " + symbol + "...")
     import asyncio
-    loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, analyze_ticker, symbol)
-    await update.message.reply_text(result, parse_mode="Markdown", disable_web_page_preview=True)
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, analyze_ticker, symbol),
+            timeout=45.0
+        )
+        await update.message.reply_text(result, parse_mode="Markdown", disable_web_page_preview=True)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "El analisis de " + symbol + " esta tardando demasiado. "
+            "Intenta de nuevo en unos segundos."
+        )
+    except Exception as e:
+        logger.error("handle_message error: " + str(e))
+        await update.message.reply_text("Error analizando " + symbol + ". Intenta de nuevo.")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
