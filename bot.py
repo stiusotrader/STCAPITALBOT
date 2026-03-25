@@ -284,6 +284,10 @@ def get_cedear_price(ticker):
 def detect_ar_asset_type(symbol):
     s = symbol.upper()
     if s.endswith(".BA") or s.endswith(".AR"):
+        # Check if it's a known CEDEAR base ticker
+        base = s.replace(".BA", "").replace(".AR", "")
+        if base in CEDEARS_YF:
+            return "cedear"
         return "accion_ar"
     if s in ["MEP", "CCL", "BLUE", "DOLAR", "USD"]:
         return "dolar_ar"
@@ -293,8 +297,8 @@ def detect_ar_asset_type(symbol):
         return "bono"
     if s in ONS_AR:
         return "on"
-    if s in CEDEARS_YF and s not in AR_ADRS_USD:
-        return "cedear"
+    # CEDEARs only detected with explicit .BA suffix (already handled above)
+    # AAPL, TSLA etc without suffix = global stock analysis
     if s in AR_ADRS_USD:
         return "adr_usd"
     if s in AR_STOCKS_YF:
