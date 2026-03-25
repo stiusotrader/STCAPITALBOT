@@ -437,24 +437,43 @@ def is_question(text):
     return False
 
 def answer_question(text):
-    """Claude answers a free-form macro/micro financial question."""
-    dolar = get_dolar()
-    dolar_str = ""
-    for name, v in dolar.items():
-        dolar_str += name + ": $" + str(v.get("venta", "")) + " | "
+    """Claude answers using REAL live market data — never hallucinated prices."""
+    dolar       = get_dolar()
+    crypto      = fetch_crypto()
+    indices     = fetch_market({"S&P 500": "^GSPC", "Nasdaq": "^IXIC"})
+    commodities = fetch_market({"Gold": "GC=F", "Oil WTI": "CL=F"})
+
+    dolar_str = " | ".join(
+        name + ": $" + str(v.get("venta", ""))
+        for name, v in dolar.items()
+    )
+    crypto_str = " | ".join(
+        name + ": $" + fmt_price(v["price"], 0) + " (" + "{:+.2f}".format(v["change"]) + "%)"
+        for name, v in crypto.items()
+    )
+    indices_str = " | ".join(
+        name + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)"
+        for name, v in indices.items()
+    )
+    commodities_str = " | ".join(
+        name + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)"
+        for name, v in commodities.items()
+    )
 
     prompt = (
-        "Sos un analista financiero y economico experto en Argentina y mercados globales de ST Capital. "
-        "El usuario te hace la siguiente consulta:\n\n"
+        "Sos analista financiero de ST Capital. El usuario pregunta:\n\n"
         "\"" + text + "\"\n\n"
-        "Respondele con un analisis claro, concreto y educativo. "
-        "Incluye contexto macro o micro segun corresponda, menciona variables relevantes "
-        "(tasas, inflacion, tipo de cambio, commodities, politica, etc). "
-        "Si es sobre Argentina, considera el contexto economico actual del pais. "
-        "Maximo 6 oraciones. Tono profesional, en español. Sin markdown ni asteriscos.\n\n"
-        "Datos de referencia actuales - Dolar Argentina: " + dolar_str
+        "REGLA CRITICA: Usa SOLO los precios de los datos en tiempo real que te doy abajo. "
+        "NUNCA uses precios de tu entrenamiento. Si el precio no esta en los datos, decilo.\n\n"
+        "Respondele de forma clara y directa mencionando los valores reales exactos. "
+        "Maximo 4 oraciones. En español. Sin markdown.\n\n"
+        "=== DATOS EN TIEMPO REAL ===\n"
+        "Dolar AR: " + dolar_str + "\n"
+        "Crypto: " + crypto_str + "\n"
+        "Indices: " + indices_str + "\n"
+        "Commodities: " + commodities_str
     )
-    return ask_claude(prompt, max_tokens=700)
+    return ask_claude(prompt, max_tokens=500)
 
 def analyze_ar_dolar():
     dolar = get_dolar()
