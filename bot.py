@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from datetime import datetime
 import pytz
@@ -11,11 +12,13 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
  
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID          = os.environ.get("CHAT_ID")
-NEWS_API_KEY     = os.environ.get("NEWS_API_KEY", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID           = os.environ.get("CHAT_ID")
+NEWS_API_KEY      = os.environ.get("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-TZ               = pytz.timezone("America/Argentina/Buenos_Aires")
+TZ                = pytz.timezone("America/Argentina/Buenos_Aires")
+ 
+# ── Asset lists ───────────────────────────────────────────────────────────────
  
 INDICES = {
     "S&P 500":   "^GSPC",
@@ -52,7 +55,45 @@ CRYPTO_IDS = {
     "BNB":      "binancecoin",
 }
  
-# ── Yahoo Finance direct API ──────────────────────────────────────────────────
+# Argentine tickers on Yahoo Finance (.BA suffix)
+AR_STOCKS_YF = {
+    "GGAL": "GGAL.BA", "BMA": "BMA.BA", "TXAR": "TXAR.BA",
+    "YPFD": "YPFD.BA", "PAMP": "PAMP.BA", "TECO2": "TECO2.BA",
+    "SUPV": "SUPV.BA", "CEPU": "CEPU.BA", "MIRG": "MIRG.BA",
+    "LOMA": "LOMA.BA", "CRES": "CRES.BA", "ALUA": "ALUA.BA",
+    "COME": "COME.BA", "EDN": "EDN.BA",  "TRAN": "TRAN.BA",
+    "VALO": "VALO.BA", "BYMA": "BYMA.BA","HARG": "HARG.BA",
+}
+ 
+# Bonos soberanos — tickers en ByMA / IOL
+BONOS_AR = [
+    "AL29", "AL30", "AL35", "AL41",
+    "GD29", "GD30", "GD35", "GD38", "GD41", "GD46",
+    "AE38", "GD29D", "GD30D",
+]
+ 
+# ONs conocidas
+ONS_AR = [
+    "YPF", "PAMPAR", "TLC1O", "AUSA", "IRCP",
+    "TECPETROL", "GENNEIA", "CGNC",
+]
+ 
+# CEDEARs (.BA on Yahoo)
+CEDEARS_YF = {
+    "AAPL": "AAPL.BA", "MSFT": "MSFT.BA", "GOOGL": "GOOGL.BA",
+    "AMZN": "AMZN.BA", "TSLA": "TSLA.BA", "NVDA": "NVDA.BA",
+    "META": "META.BA", "BABA": "BABA.BA", "MELI": "MELI.BA",
+}
+ 
+AR_TICKER_SET = (
+    set(AR_STOCKS_YF.keys()) |
+    set(BONOS_AR) |
+    set(ONS_AR) |
+    set(CEDEARS_YF.keys()) |
+    {"AL29D","AL30D","AL35D","GD29D","GD30D","GD35D","GD38D","GD41D","GD46D"}
+)
+ 
+# ── Yahoo Finance ─────────────────────────────────────────────────────────────
  
 def get_yahoo_data(symbol, period="1y"):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -65,15 +106,14 @@ def get_yahoo_data(symbol, period="1y"):
         result = data.get("chart", {}).get("result", [])
         if not result:
             return None
-        closes  = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-        volumes = result[0].get("indicators", {}).get("quote", [{}])[0].get("volume", [])
-        closes  = [c for c in closes if c is not None]
-        volumes = [v if v is not None else 0 for v in volumes]
+        quotes  = result[0].get("indicators", {}).get("quote", [{}])[0]
+        closes  = [c for c in quotes.get("close", []) if c is not None]
+        volumes = [v if v is not None else 0 for v in quotes.get("volume", [])]
         if not closes:
             return None
         return {"closes": closes, "volumes": volumes}
     except Exception as e:
-        logger.warning("YF API error for " + symbol + ": " + str(e))
+        logger.warning("YF error " + symbol + ": " + str(e))
         return None
  
 def get_ticker_info(symbol):
@@ -94,32 +134,190 @@ def get_ticker_info(symbol):
             "marketCap": price_data.get("marketCap", {}).get("raw"),
         }
     except Exception as e:
-        logger.warning("Ticker info error: " + str(e))
+        logger.warning("Ticker info error " + symbol + ": " + str(e))
         return {}
+ 
+# ── Argentine data sources ────────────────────────────────────────────────────
+ 
+def get_dolar_ar():
+    """Fetch USD types from dolarito.ar public API."""
+    try:
+        r    = requests.get("https://dolarito.ar/api/frontend/history/1", timeout=10,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        data = r.json()
+        result = {}
+        for item in data:
+            name = item.get("nombre", "").lower()
+            buy  = item.get("compra")
+            sell = item.get("venta")
+            if buy and sell:
+                if "blue" in name:
+                    result["Blue"] = {"compra": buy, "venta": sell}
+                elif "mep" in name or "bolsa" in name:
+                    result["MEP"] = {"compra": buy, "venta": sell}
+                elif "contado" in name or "ccl" in name:
+                    result["CCL"] = {"compra": buy, "venta": sell}
+                elif "oficial" in name:
+                    result["Oficial"] = {"compra": buy, "venta": sell}
+        return result
+    except Exception as e:
+        logger.warning("Dolar AR error: " + str(e))
+        return {}
+ 
+def get_dolar_ar_v2():
+    """Fallback: dolarapi.com"""
+    try:
+        endpoints = {
+            "Blue":    "https://dolarapi.com/v1/dolares/blue",
+            "MEP":     "https://dolarapi.com/v1/dolares/bolsa",
+            "CCL":     "https://dolarapi.com/v1/dolares/contadoconliqui",
+            "Oficial": "https://dolarapi.com/v1/dolares/oficial",
+        }
+        result = {}
+        for name, url in endpoints.items():
+            r    = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            data = r.json()
+            if data.get("compra") and data.get("venta"):
+                result[name] = {"compra": data["compra"], "venta": data["venta"]}
+        return result
+    except Exception as e:
+        logger.warning("Dolar AR v2 error: " + str(e))
+        return {}
+ 
+def get_dolar():
+    d = get_dolar_ar_v2()
+    if not d:
+        d = get_dolar_ar()
+    return d
+ 
+def get_bono_price(ticker):
+    """Fetch Argentine bond price from Ambito Financiero."""
+    try:
+        url = "https://mercados.ambito.com/titulo/" + ticker + "/info"
+        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        data = r.json()
+        price  = data.get("ultimoPrecio") or data.get("ultimo")
+        change = data.get("variacion") or data.get("variacionPorcentual") or 0
+        if price:
+            try:
+                price  = float(str(price).replace(",", ".").replace("%", ""))
+                change = float(str(change).replace(",", ".").replace("%", ""))
+            except Exception:
+                pass
+            return {"price": price, "change": change, "source": "ambito"}
+        return None
+    except Exception as e:
+        logger.warning("Bono " + ticker + " error: " + str(e))
+        return None
+ 
+def get_ar_stock_price(ticker):
+    """Try Yahoo Finance .BA first, then Ambito."""
+    yf_ticker = AR_STOCKS_YF.get(ticker, ticker + ".BA")
+    data = get_yahoo_data(yf_ticker, "2d")
+    if data and len(data["closes"]) >= 2:
+        curr = data["closes"][-1]
+        prev = data["closes"][-2]
+        return {"price": float(curr), "change": float(((curr - prev) / prev) * 100), "source": "yahoo"}
+    # Fallback Ambito
+    try:
+        url = "https://mercados.ambito.com/acciones/" + ticker + "/info"
+        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        data = r.json()
+        price  = data.get("ultimoPrecio") or data.get("ultimo")
+        change = data.get("variacion") or 0
+        if price:
+            price  = float(str(price).replace(",", "."))
+            change = float(str(change).replace(",", ".").replace("%", ""))
+            return {"price": price, "change": change, "source": "ambito"}
+    except Exception:
+        pass
+    return None
+ 
+def get_cedear_price(ticker):
+    """CEDEARs via Yahoo Finance .BA"""
+    yf_ticker = CEDEARS_YF.get(ticker, ticker + ".BA")
+    data = get_yahoo_data(yf_ticker, "2d")
+    if data and len(data["closes"]) >= 2:
+        curr = data["closes"][-1]
+        prev = data["closes"][-2]
+        return {"price": float(curr), "change": float(((curr - prev) / prev) * 100), "source": "yahoo"}
+    return None
+ 
+def detect_ar_asset_type(symbol):
+    """Returns: 'bono', 'on', 'cedear', 'accion_ar', 'dolar_ar', or None"""
+    s = symbol.upper()
+    if s in ["MEP", "CCL", "BLUE", "DOLAR", "USD"]:
+        return "dolar_ar"
+    if s in BONOS_AR or s.rstrip("D") in BONOS_AR:
+        return "bono"
+    if s in ONS_AR:
+        return "on"
+    if s in CEDEARS_YF:
+        return "cedear"
+    if s in AR_STOCKS_YF:
+        return "accion_ar"
+    # Heuristic: ends in digit pattern like AL30, GD35
+    if re.match(r'^(AL|GD|AE|TX|TV|PBA|BDC)\d', s):
+        return "bono"
+    return None
  
 # ── Claude AI ─────────────────────────────────────────────────────────────────
  
-def ask_claude(prompt):
+def ask_claude(prompt, max_tokens=800):
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key":         ANTHROPIC_API_KEY,
+                "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
+                "content-type": "application/json",
             },
             json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 600,
-                "messages":   [{"role": "user", "content": prompt}],
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
             },
             timeout=30,
         )
         data = r.json()
         return data.get("content", [{}])[0].get("text", "").strip()
     except Exception as e:
-        logger.error("Claude API error: " + str(e))
+        logger.error("Claude error: " + str(e))
         return ""
+ 
+def is_question(text):
+    """Detect if user sent a free-form question rather than a ticker."""
+    words = text.strip().split()
+    if len(words) >= 4:
+        return True
+    question_words = ["que", "qué", "como", "cómo", "cuando", "cuándo", "por", "cual",
+                      "cuál", "explica", "analiza", "contame", "hablame", "describe",
+                      "situacion", "situación", "contexto", "opinion", "opinión"]
+    low = text.lower()
+    for w in question_words:
+        if w in low:
+            return True
+    return False
+ 
+def answer_question(text):
+    """Claude answers a free-form macro/micro financial question."""
+    dolar = get_dolar()
+    dolar_str = ""
+    for name, v in dolar.items():
+        dolar_str += name + ": $" + str(v.get("venta", "")) + " | "
+ 
+    prompt = (
+        "Sos un analista financiero y economico experto en Argentina y mercados globales de ST Capital. "
+        "El usuario te hace la siguiente consulta:\n\n"
+        "\"" + text + "\"\n\n"
+        "Respondele con un analisis claro, concreto y educativo. "
+        "Incluye contexto macro o micro segun corresponda, menciona variables relevantes "
+        "(tasas, inflacion, tipo de cambio, commodities, politica, etc). "
+        "Si es sobre Argentina, considera el contexto economico actual del pais. "
+        "Maximo 6 oraciones. Tono profesional, en español. Sin markdown ni asteriscos.\n\n"
+        "Datos de referencia actuales - Dolar Argentina: " + dolar_str
+    )
+    return ask_claude(prompt, max_tokens=700)
  
 # ── Helpers ───────────────────────────────────────────────────────────────────
  
@@ -166,15 +364,203 @@ def compute_rs_score(ticker_closes, spy_closes):
 def pct_from_ma(current, ma):
     return round(((current - ma) / ma) * 100, 2)
  
-# ── Ticker analysis ───────────────────────────────────────────────────────────
+# ── Argentine ticker analysis ─────────────────────────────────────────────────
+ 
+def analyze_ar_dolar():
+    dolar = get_dolar()
+    if not dolar:
+        return "No pude obtener los datos del dolar ahora. Intenta en unos minutos."
+ 
+    lines = ["*Dolar Argentina* 🇦🇷", ""]
+    for name, v in dolar.items():
+        compra = v.get("compra", "-")
+        venta  = v.get("venta", "-")
+        lines.append("💵 *" + name + "*: Compra $" + str(compra) + " | Venta $" + str(venta))
+ 
+    # Brecha
+    oficial = dolar.get("Oficial", {}).get("venta")
+    blue    = dolar.get("Blue", {}).get("venta")
+    mep     = dolar.get("MEP", {}).get("venta")
+    ccl     = dolar.get("CCL", {}).get("venta")
+    if oficial and blue:
+        try:
+            brecha = round(((float(blue) - float(oficial)) / float(oficial)) * 100, 1)
+            lines.append("")
+            lines.append("📊 *Brecha Blue/Oficial:* " + str(brecha) + "%")
+        except Exception:
+            pass
+ 
+    analysis = ask_claude(
+        "Sos analista financiero de Argentina de ST Capital. "
+        "Con estos datos del dolar, escribi un analisis de 3-4 oraciones en español sobre "
+        "el contexto cambiario argentino actual: que implica la brecha, como esta el mercado "
+        "cambiario, y que factores macro explican estos valores. Sin markdown.\n\n"
+        "Dolar Oficial: " + str(oficial) + " | Blue: " + str(blue) +
+        " | MEP: " + str(mep) + " | CCL: " + str(ccl),
+        max_tokens=400
+    )
+ 
+    if analysis:
+        lines.append("")
+        lines.append("*Analisis cambiario*")
+        lines.append(analysis)
+ 
+    lines.append("")
+    lines.append("_ST Capital - No es asesoramiento financiero._")
+    return "\n".join(lines)
+ 
+def analyze_ar_bono(symbol):
+    data = get_bono_price(symbol)
+    if not data:
+        return "No encontre datos para el bono *" + symbol + "*. Verifica el ticker (ej: AL30, GD35, GD30)."
+ 
+    price  = data["price"]
+    change = data["change"]
+ 
+    analysis = ask_claude(
+        "Sos analista de renta fija argentina de ST Capital. "
+        "El bono " + symbol + " cotiza a $" + str(price) + " con una variacion de " + str(change) + "% hoy. "
+        "Escribi un analisis de 4 oraciones en español que explique: "
+        "1) Que es este bono y sus caracteristicas principales (ley, vencimiento, moneda). "
+        "2) Que factores macro argentinos e internacionales afectan su precio. "
+        "3) Como esta el contexto actual de la deuda soberana argentina. "
+        "Sin markdown ni asteriscos.",
+        max_tokens=500
+    )
+ 
+    lines = ["*Bono " + symbol + "* 🇦🇷", ""]
+    lines.append(arrow_emoji(change) + " *Precio:* $" + fmt_price(price) + "  " + "{:+.2f}".format(change) + "%")
+    lines.append("📡 _Fuente: Ambito Financiero_")
+    if analysis:
+        lines.append("")
+        lines.append("*Analisis*")
+        lines.append(analysis)
+    lines.append("")
+    lines.append("_ST Capital - No es asesoramiento financiero._")
+    return "\n".join(lines)
+ 
+def analyze_ar_stock(symbol):
+    data = get_ar_stock_price(symbol)
+    if not data:
+        return "No encontre datos para *" + symbol + "*. Verifica el ticker (ej: GGAL, BMA, YPFD, PAMP)."
+ 
+    price  = data["price"]
+    change = data["change"]
+    source = data["source"]
+ 
+    # Try to get historical for indicators
+    yf_ticker = AR_STOCKS_YF.get(symbol, symbol + ".BA")
+    hist = get_yahoo_data(yf_ticker, "1y")
+    rsi = sma50 = dist_sma50 = high_52w = low_52w = None
+    if hist and len(hist["closes"]) >= 16:
+        closes = hist["closes"]
+        rsi    = compute_rsi(closes)
+        if len(closes) >= 50:
+            sma50      = round(float(np.mean(closes[-50:])), 2)
+            dist_sma50 = pct_from_ma(price, sma50)
+        high_52w = round(float(np.max(closes)), 2)
+        low_52w  = round(float(np.min(closes)), 2)
+ 
+    analysis = ask_claude(
+        "Sos analista de acciones argentinas de ST Capital. "
+        "La accion " + symbol + " cotiza a $" + fmt_price(price) + " ARS con " + "{:+.2f}".format(change) + "% hoy. "
+        + ("RSI: " + str(rsi) + ". " if rsi else "")
+        + ("SMA50: $" + fmt_price(sma50) + " (" + "{:+.2f}".format(dist_sma50) + "%). " if sma50 else "")
+        + ("MAX 52W: $" + fmt_price(high_52w) + " | MIN 52W: $" + fmt_price(low_52w) + ". " if high_52w else "")
+        + "Escribi un analisis de 4-5 oraciones en español que incluya: "
+        "1) Que hace esta empresa y su rol en la economia argentina. "
+        "2) Que variables macro (tipo de cambio, inflacion, tarifas, politica) afectan su precio. "
+        "3) Una lectura del momento tecnico actual. "
+        "Sin markdown ni asteriscos.",
+        max_tokens=550
+    )
+ 
+    lines = ["*" + symbol + "* (Accion ARG) 🇦🇷", ""]
+    lines.append(arrow_emoji(change) + " *Precio:* $" + fmt_price(price) + " ARS  " + "{:+.2f}".format(change) + "%")
+    if rsi is not None:
+        tag = " - Sobrecomprado" if rsi >= 70 else (" - Sobrevendido" if rsi <= 30 else "")
+        lines.append("📉 *RSI 14:* " + str(rsi) + tag)
+    if sma50 is not None:
+        lines.append(arrow_emoji(dist_sma50) + " *Dist SMA 50:* " + "{:+.2f}".format(dist_sma50) + "% (SMA: $" + fmt_price(sma50) + ")")
+    if high_52w:
+        lines.append("📈 *MAX 52W:* $" + fmt_price(high_52w))
+        lines.append("📉 *MIN 52W:* $" + fmt_price(low_52w))
+    lines.append("📡 _Fuente: " + source + "_")
+    if analysis:
+        lines.append("")
+        lines.append("*Analisis*")
+        lines.append(analysis)
+    lines.append("")
+    lines.append("_ST Capital - No es asesoramiento financiero._")
+    return "\n".join(lines)
+ 
+def analyze_cedear(symbol):
+    data = get_cedear_price(symbol)
+    if not data:
+        return "No encontre datos para el CEDEAR *" + symbol + "*. Verifica (ej: AAPL, TSLA, GOOGL, MELI)."
+ 
+    price  = data["price"]
+    change = data["change"]
+ 
+    # Also get the underlying US stock for comparison
+    us_data = get_yahoo_data(symbol, "2d")
+    us_price = us_change = None
+    if us_data and len(us_data["closes"]) >= 2:
+        us_price  = us_data["closes"][-1]
+        us_change = ((us_data["closes"][-1] - us_data["closes"][-2]) / us_data["closes"][-2]) * 100
+ 
+    analysis = ask_claude(
+        "Sos analista financiero de ST Capital especializado en CEDEARs argentinos. "
+        "El CEDEAR de " + symbol + " cotiza a $" + fmt_price(price) + " ARS (" + "{:+.2f}".format(change) + "% hoy). "
+        + ("El subyacente en USA cotiza a $" + fmt_price(us_price) + " USD (" + "{:+.2f}".format(us_change) + "%). " if us_price else "")
+        + "Escribi un analisis de 4 oraciones en español que explique: "
+        "1) Que es un CEDEAR y como funciona este instrumento en Argentina. "
+        "2) Como el tipo de cambio (CCL/MEP) afecta el precio en pesos. "
+        "3) El contexto actual del subyacente en mercados internacionales. "
+        "Sin markdown ni asteriscos.",
+        max_tokens=500
+    )
+ 
+    lines = ["*CEDEAR " + symbol + "* 🇦🇷", ""]
+    lines.append(arrow_emoji(change) + " *Precio ARS:* $" + fmt_price(price) + "  " + "{:+.2f}".format(change) + "%")
+    if us_price:
+        lines.append(arrow_emoji(us_change) + " *Subyacente USD:* $" + fmt_price(us_price) + "  " + "{:+.2f}".format(us_change) + "%")
+    lines.append("📡 _Fuente: Yahoo Finance .BA_")
+    if analysis:
+        lines.append("")
+        lines.append("*Analisis*")
+        lines.append(analysis)
+    lines.append("")
+    lines.append("_ST Capital - No es asesoramiento financiero._")
+    return "\n".join(lines)
+ 
+# ── Global ticker analysis ────────────────────────────────────────────────────
  
 def analyze_ticker(symbol):
     symbol = symbol.upper().strip()
     logger.info("Analyzing: " + symbol)
  
+    # Route Argentine assets
+    ar_type = detect_ar_asset_type(symbol)
+    if ar_type == "dolar_ar" or symbol in ["DOLAR", "MEP", "CCL", "BLUE"]:
+        return analyze_ar_dolar()
+    if ar_type == "bono":
+        return analyze_ar_bono(symbol)
+    if ar_type == "on":
+        return analyze_ar_bono(symbol)  # same flow
+    if ar_type == "cedear":
+        return analyze_cedear(symbol)
+    if ar_type == "accion_ar":
+        return analyze_ar_stock(symbol)
+ 
+    # Try as .BA if not found globally
     data = get_yahoo_data(symbol, "1y")
-    if not data or len(data["closes"]) < 20:
-        return "No encontre datos para " + symbol + ". Verifica que sea un ticker valido (ej: AAPL, BTC-USD, GC=F, SPY)"
+    if not data or len(data["closes"]) < 5:
+        # Try with .BA suffix
+        data_ba = get_yahoo_data(symbol + ".BA", "1y")
+        if data_ba and len(data_ba["closes"]) >= 5:
+            return analyze_ar_stock(symbol)
+        return "No encontre datos para *" + symbol + "*.\n\nSi es un activo argentino, proba con:\n- Acciones: GGAL, BMA, YPFD, PAMP\n- Bonos: AL30, GD35, GD30\n- CEDEARs: AAPL, TSLA, GOOGL\n- Dolar: BLUE, MEP, CCL"
  
     closes  = data["closes"]
     volumes = data["volumes"]
@@ -182,8 +568,7 @@ def analyze_ticker(symbol):
  
     prev_close = closes[-2] if len(closes) >= 2 else current
     day_chg    = ((current - prev_close) / prev_close) * 100
- 
-    rsi = compute_rsi(closes) if len(closes) >= 16 else None
+    rsi        = compute_rsi(closes) if len(closes) >= 16 else None
  
     rs_score = None
     try:
@@ -223,38 +608,34 @@ def analyze_ticker(symbol):
     industry = info.get("industry", "")
     mktcap   = info.get("marketCap")
  
-    # Build technical summary for Claude
+    ticker_news      = fetch_news(name + " " + symbol, 4)
+    ticker_news_text = "\n".join(ticker_news[:4]) if ticker_news else "Sin noticias recientes."
+ 
     tech_summary = (
         "Activo: " + name + " (" + symbol + ")\n"
-        "Precio actual: $" + fmt_price(current) + " (" + "{:+.2f}".format(day_chg) + "% hoy)\n"
+        "Precio: $" + fmt_price(current) + " (" + "{:+.2f}".format(day_chg) + "% hoy)\n"
         + ("RSI 14: " + str(rsi) + "\n" if rsi else "")
         + ("RS Score vs SPY: " + "{:+.2f}".format(rs_score) + "%\n" if rs_score is not None else "")
-        + ("Distancia EMA 200: " + "{:+.2f}".format(dist_ema200) + "%\n" if dist_ema200 is not None else "")
-        + ("Distancia SMA 50: " + "{:+.2f}".format(dist_sma50) + "%\n" if dist_sma50 is not None else "")
+        + ("Dist EMA 200: " + "{:+.2f}".format(dist_ema200) + "%\n" if dist_ema200 is not None else "")
+        + ("Dist SMA 50: " + "{:+.2f}".format(dist_sma50) + "%\n" if dist_sma50 is not None else "")
         + "MAX 52W: $" + fmt_price(high_52w) + " (" + "{:+.2f}".format(dist_52w_high) + "% del maximo)\n"
         + "MIN 52W: $" + fmt_price(low_52w) + "\n"
-        + "Volumen ratio vs 20d: " + str(vol_ratio) + "x\n"
+        + "Volumen ratio 20d: " + str(vol_ratio) + "x\n"
     )
  
-    # Fetch recent news for this specific ticker
-    ticker_news = fetch_news(name + " " + symbol + " stock", 4)
-    ticker_news_text = "\n".join(ticker_news[:4]) if ticker_news else "Sin noticias recientes disponibles."
- 
     claude_analysis = ask_claude(
-        "Sos un analista financiero senior de ST Capital. Te piden un analisis completo de " + name + " (" + symbol + ").\n\n"
-        "Escribi DOS secciones separadas por una linea en blanco:\n\n"
-        "SECCION 1 - CONTEXTO GLOBAL (3-4 oraciones):\n"
-        "Explica que es este activo, que rol cumple a nivel mundial, y cuales son las principales "
-        "variables macro, geopoliticas o sectoriales que afectan su precio hoy. "
-        "Menciona factores como tasas de interes, competencia, regulacion, demanda global, ciclo economico "
-        "o cualquier driver especifico del activo. Se concreto y educativo.\n\n"
-        "SECCION 2 - ANALISIS TECNICO (3-4 oraciones):\n"
-        "Con los datos tecnicos provistos, describe la tendencia actual, si esta en zona de soporte o resistencia, "
-        "que dicen el RSI y las medias moviles sobre el momentum, y una conclusion sobre el momento del activo.\n\n"
-        "No uses markdown, no uses asteriscos, no pongas titulos de seccion, solo el texto corrido separado por linea en blanco.\n\n"
-        "Datos tecnicos:\n" + tech_summary + "\n"
-        "Noticias recientes:\n" + ticker_news_text,
-        max_tokens=600
+        "Sos analista financiero senior de ST Capital. Analiza " + name + " (" + symbol + ").\n\n"
+        "Escribi DOS parrafos separados por linea en blanco:\n\n"
+        "PARRAFO 1 - CONTEXTO GLOBAL (3-4 oraciones): "
+        "Que es este activo, que rol cumple a nivel mundial, y cuales son las principales "
+        "variables macro, geopoliticas o sectoriales que afectan su precio hoy.\n\n"
+        "PARRAFO 2 - ANALISIS TECNICO (3-4 oraciones): "
+        "Con los datos tecnicos, describe la tendencia, zonas de soporte/resistencia, "
+        "que dicen RSI y medias moviles, y una conclusion del momento del activo.\n\n"
+        "Sin markdown, sin asteriscos, sin titulos.\n\n"
+        "Datos tecnicos:\n" + tech_summary +
+        "\nNoticias:\n" + ticker_news_text,
+        max_tokens=650
     )
  
     lines = []
@@ -265,7 +646,6 @@ def analyze_ticker(symbol):
     lines.append(arrow_emoji(day_chg) + " *Price:* $" + fmt_price(current) + "  " + "{:+.2f}".format(day_chg) + "%")
     if mktcap:
         lines.append("🏦 *Market Cap:* " + fmt_large(mktcap))
- 
     lines.append("")
     lines.append("*Indicadores tecnicos*")
     if rsi is not None:
@@ -278,16 +658,14 @@ def analyze_ticker(symbol):
         lines.append(arrow_emoji(dist_ema200) + " *Dist EMA 200:* " + "{:+.2f}".format(dist_ema200) + "% (EMA: $" + fmt_price(ema200) + ")")
     if sma50 is not None:
         lines.append(arrow_emoji(dist_sma50) + " *Dist SMA 50:* " + "{:+.2f}".format(dist_sma50) + "% (SMA: $" + fmt_price(sma50) + ")")
- 
     lines.append("")
     lines.append("*52W Range*")
     lines.append("📈 *MAX 52W:* $" + fmt_price(high_52w) + "  (" + "{:+.2f}".format(dist_52w_high) + "% del maximo)")
     lines.append("📉 *MIN 52W:* $" + fmt_price(low_52w) + "  (" + "{:+.2f}".format(dist_52w_low) + "% del minimo)")
- 
     lines.append("")
     lines.append("*Volumen*")
-    vol_emoji = "🔥" if vol_ratio > 1.5 else ("📊" if vol_ratio >= 0.8 else "😴")
-    lines.append(vol_emoji + " *Vol ultimo dia:* " + "{:,}".format(vol_last))
+    vol_emoji_str = "🔥" if vol_ratio > 1.5 else ("📊" if vol_ratio >= 0.8 else "😴")
+    lines.append(vol_emoji_str + " *Vol ultimo dia:* " + "{:,}".format(vol_last))
     lines.append("📊 *Vol promedio 20d:* " + "{:,}".format(vol_avg20) + " (ratio: " + str(vol_ratio) + "x)")
  
     if claude_analysis:
@@ -304,9 +682,9 @@ def analyze_ticker(symbol):
     lines.append("_ST Capital - No es asesoramiento financiero._")
     return "\n".join(lines)
  
-# ── Market data ───────────────────────────────────────────────────────────────
+# ── Market data helpers ───────────────────────────────────────────────────────
  
-def fetch_market(symbols, decimals=2):
+def fetch_market(symbols):
     results = {}
     for name, ticker in symbols.items():
         data = get_yahoo_data(ticker, "2d")
@@ -351,8 +729,7 @@ def build_market_snapshot():
     commodities = fetch_market(COMMODITIES)
     forex       = fetch_market(FOREX)
     stocks      = fetch_market(US_STOCKS)
- 
-    snapshot = "INDICES GLOBALES:\n"
+    snapshot = "INDICES:\n"
     for name, v in indices.items():
         snapshot += name + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
     snapshot += "\nCRYPTO:\n"
@@ -375,19 +752,13 @@ def build_opening():
     now = datetime.now(TZ).strftime("%A %d %b %Y")
     snapshot, indices, crypto, commodities, _, _ = build_market_snapshot()
     news = fetch_news("markets stocks economy", 4)
- 
-    news_text = ""
-    if news:
-        news_text = "\nNoticias destacadas del dia:\n" + "\n".join(["- " + n for n in news[:4]])
- 
+    news_text = "\n".join(["- " + n for n in news[:4]]) if news else ""
     analysis = ask_claude(
-        "Sos un analista financiero experto de ST Capital. Hoy es " + now + ". "
-        "Con los siguientes datos de mercado al inicio del dia, escribi un analisis de apertura "
-        "de 4-5 oraciones en español. Destaca las tendencias mas importantes, que activos lideran "
-        "o rezagan, y que deberia monitorear un trader hoy. Se directo y profesional. Sin markdown.\n\n"
-        + snapshot + news_text
+        "Sos analista de ST Capital. Hoy es " + now + ". Con estos datos de apertura, "
+        "escribi un analisis de 4-5 oraciones en español sobre las tendencias del dia, "
+        "que monitorear y el contexto macro. Directo, sin markdown.\n\n" + snapshot + "\nNoticias:\n" + news_text,
+        max_tokens=450
     )
- 
     msg = "🌅 *APERTURA - ST Capital*\n_" + now + "_\n"
     msg += section("📊 *INDICES GLOBALES*", indices)
     msg += section("🪙 *CRYPTO*", crypto, decimals=0)
@@ -403,13 +774,10 @@ def build_opening():
 def build_midmorning():
     snapshot, indices, _, _, _, stocks = build_market_snapshot()
     news = fetch_news("stock market Wall Street", 3)
- 
     analysis = ask_claude(
-        "Sos un analista de ST Capital. Con estos datos de mercado a media manana, "
-        "escribi un update breve de 3 oraciones en español sobre como esta yendo la sesion "
-        "y que sectores o activos merecen atencion. Sin markdown.\n\n" + snapshot
+        "Sos analista de ST Capital. Update mid-morning: 3 oraciones en español sobre la sesion. Sin markdown.\n\n" + snapshot,
+        max_tokens=300
     )
- 
     msg = "📊 *MID-MORNING - ST Capital*\n"
     msg += section("📈 *INDICES*", indices)
     msg += section("🏢 *US STOCKS*", stocks)
@@ -424,13 +792,10 @@ def build_midmorning():
 def build_midday():
     snapshot, _, crypto, commodities, forex, _ = build_market_snapshot()
     news = fetch_news("commodity oil gold forex macro", 3)
- 
     analysis = ask_claude(
-        "Sos un analista de ST Capital. Con estos datos de mercado al mediodia, "
-        "escribi un analisis de 3 oraciones en español enfocado en commodities, forex y crypto. "
-        "Que narrativa macro domina? Sin markdown.\n\n" + snapshot
+        "Sos analista de ST Capital. Mediodia: 3 oraciones en español sobre commodities, forex y crypto. Sin markdown.\n\n" + snapshot,
+        max_tokens=300
     )
- 
     msg = "🔴 *MEDIODIA - ST Capital*\n"
     msg += section("🛢 *COMMODITIES*", commodities)
     msg += section("💱 *FOREX*", forex, decimals=4)
@@ -446,13 +811,11 @@ def build_midday():
 def build_preclose():
     snapshot, indices, _, _, _, stocks = build_market_snapshot()
     news = fetch_news("earnings stocks Wall Street close", 3)
- 
     analysis = ask_claude(
-        "Sos un analista de ST Capital. Faltan 2 horas para el cierre de Wall Street. "
-        "Con estos datos, escribi un analisis de 3 oraciones en español sobre como se perfila "
-        "el cierre y que niveles o activos son clave monitorear. Sin markdown.\n\n" + snapshot
+        "Sos analista de ST Capital. Faltan 2hs para el cierre de Wall Street. "
+        "3 oraciones en español sobre como se perfila el cierre. Sin markdown.\n\n" + snapshot,
+        max_tokens=300
     )
- 
     msg = "📈 *PRE-CIERRE USA - ST Capital*\n"
     msg += section("🏢 *US STOCKS*", stocks)
     msg += section("📊 *INDICES USA*", {k: v for k, v in indices.items() if k in ["S&P 500", "Nasdaq", "Dow Jones"]})
@@ -466,14 +829,10 @@ def build_preclose():
  
 def build_close():
     snapshot, indices, crypto, commodities, _, stocks = build_market_snapshot()
- 
     analysis = ask_claude(
-        "Sos un analista de ST Capital. El mercado acaba de cerrar. "
-        "Con estos datos del cierre, escribi un resumen del dia de 4-5 oraciones en español. "
-        "Que movimientos fueron mas relevantes? Que contexto deja para manana? Sin markdown.\n\n"
-        + snapshot
+        "Sos analista de ST Capital. El mercado cerro. 4-5 oraciones en español resumiendo el dia. Sin markdown.\n\n" + snapshot,
+        max_tokens=450
     )
- 
     msg = "🌙 *CIERRE DEL DIA - ST Capital*\n"
     msg += section("📊 *INDICES*", indices)
     msg += section("🏢 *US STOCKS*", stocks)
@@ -484,33 +843,26 @@ def build_close():
     msg += "\n\n_ST Capital - Hasta manana_"
     return msg
  
- 
- 
- 
 def build_hourly():
     now = datetime.now(TZ).strftime("%H:%M hs - %d %b %Y")
     snapshot, indices, crypto, commodities, forex, stocks = build_market_snapshot()
     news_markets = fetch_news("markets stocks Wall Street economy", 4)
-    news_war = fetch_news("war conflict geopolitics military crisis", 3)
-    news_usa = fetch_news("United States economy breaking news", 3)
- 
+    news_war     = fetch_news("war conflict geopolitics military crisis", 3)
+    news_usa     = fetch_news("United States economy breaking news", 3)
     all_news_text = (
         "Mercados: " + " | ".join(news_markets[:3])
         + "\nGeopolitica: " + " | ".join(news_war[:3])
         + "\nUSA: " + " | ".join(news_usa[:3])
     )
- 
     prompt = (
         "Sos analista global de ST Capital. Son las " + now + " hora Argentina. "
-        "Escribi un resumen con estas 3 secciones (1-2 oraciones cada una, sin titulos ni markdown):\n"
-        "MERCADOS: estado de indices, commodities y cripto ahora.\n"
+        "Resumen horario con 3 secciones (1-2 oraciones c/u, sin titulos ni markdown):\n"
+        "MERCADOS: estado de indices, commodities y cripto.\n"
         "GEOPOLITICA: conflictos o tensiones mundiales relevantes.\n"
         "USA: noticia mas trascendente de Estados Unidos ahora.\n\n"
         "Datos:\n" + snapshot + "\n\nNoticias:\n" + all_news_text
     )
- 
     analysis = ask_claude(prompt, max_tokens=500)
- 
     msg = "🌐 *RESUMEN " + now + "*\n_ST Capital_\n"
     msg += section("📊 *INDICES*", indices)
     msg += section("🛢 *COMMODITIES*", commodities)
@@ -525,24 +877,42 @@ def build_hourly():
     msg += "\n\n_ST Capital_"
     return msg
  
-# ── Telegram handlers ─────────────────────────────────────────────────────────
+# ── Telegram handler ──────────────────────────────────────────────────────────
  
 APP = None
  
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    text   = update.message.text.strip()
-    symbol = text.upper().replace(" ", "").lstrip("/")
  
-    if symbol in ["START", "HELP", "AYUDA"]:
+    text = update.message.text.strip()
+ 
+    if text.upper().lstrip("/") in ["START", "HELP", "AYUDA"]:
         await update.message.reply_text(
-            "ST Capital Bot\n\nEscribime cualquier ticker:\nAAPL, BTC-USD, GC=F, SPY, TSLA, ETH-USD, ^GSPC..."
+            "ST Capital Bot\n\n"
+            "Escribime cualquier ticker o pregunta:\n\n"
+            "GLOBALES: AAPL, BTC-USD, GC=F, SPY, TSLA\n"
+            "ARGENTINOS: GGAL, BMA, YPFD, AL30, GD35\n"
+            "CEDEARs: AAPL, TSLA, GOOGL (detecta automatico)\n"
+            "DOLAR: BLUE, MEP, CCL\n\n"
+            "O preguntame algo: 'Como esta la economia argentina?'"
         )
         return
  
-    await update.message.reply_text("Analizando " + symbol + "...")
+    # Detect if it's a question or a ticker
+    if is_question(text):
+        await update.message.reply_text("Analizando tu consulta...")
+        import asyncio
+        loop   = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, answer_question, text)
+        if result:
+            await update.message.reply_text(result, disable_web_page_preview=True)
+        else:
+            await update.message.reply_text("No pude generar un analisis. Intenta de nuevo.")
+        return
  
+    symbol = text.upper().replace(" ", "").lstrip("/")
+    await update.message.reply_text("Analizando " + symbol + "...")
     import asyncio
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, analyze_ticker, symbol)
@@ -583,9 +953,8 @@ def main():
             scheduler.add_job(make_job(build_hourly), "cron", hour=h, minute=0)
  
     scheduler.start()
-    logger.info("ST Capital Bot running - Claude AI integrated.")
+    logger.info("ST Capital Bot v10 - Argentina + Global + Claude AI.")
     APP.run_polling(drop_pending_updates=True)
  
 if __name__ == "__main__":
     main()
-
