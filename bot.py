@@ -65,12 +65,24 @@ AR_STOCKS_YF = {
     "VALO": "VALO.BA", "BYMA": "BYMA.BA","HARG": "HARG.BA",
 }
 
-# Bonos soberanos — tickers en ByMA / IOL
+# Bonos soberanos con tickers Yahoo Finance .BA
 BONOS_AR = [
     "AL29", "AL30", "AL35", "AL41",
     "GD29", "GD30", "GD35", "GD38", "GD41", "GD46",
-    "AE38", "GD29D", "GD30D",
+    "AE38",
 ]
+
+# Mapeo bono -> ticker Yahoo Finance
+BONOS_YF = {
+    "AL29": "AL29.BA", "AL30": "AL30.BA", "AL35": "AL35.BA", "AL41": "AL41.BA",
+    "GD29": "GD29.BA", "GD30": "GD30.BA", "GD35": "GD35.BA",
+    "GD38": "GD38.BA", "GD41": "GD41.BA", "GD46": "GD46.BA",
+    "AE38": "AE38.BA",
+    # versiones dolar (D al final)
+    "AL29D": "AL29D.BA", "AL30D": "AL30D.BA", "AL35D": "AL35D.BA",
+    "GD29D": "GD29D.BA", "GD30D": "GD30D.BA", "GD35D": "GD35D.BA",
+    "GD38D": "GD38D.BA", "GD41D": "GD41D.BA", "GD46D": "GD46D.BA",
+}
 
 # ONs conocidas
 ONS_AR = [
@@ -220,29 +232,36 @@ def get_dolar():
     return d
 
 def get_bono_price(ticker):
-    """Fetch Argentine bond price — tries multiple sources."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    """Fetch Argentine bond price — Yahoo Finance .BA as primary, dolarapi as fallback."""
+    ticker_up = ticker.upper()
 
-    # Source 1: IOL API
+    # Source 1: Yahoo Finance .BA (most reliable for Railway)
+    yf_ticker = BONOS_YF.get(ticker_up, ticker_up + ".BA")
+    data = get_yahoo_data(yf_ticker, "2d")
+    if data and len(data["closes"]) >= 1:
+        curr  = data["closes"][-1]
+        prev  = data["closes"][-2] if len(data["closes"]) >= 2 else curr
+        chg   = ((curr - prev) / prev) * 100 if prev else 0
+        return {"price": float(curr), "change": round(float(chg), 2), "source": "Yahoo .BA"}
+
+    # Source 2: dolarapi.com bonos endpoint
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        url  = "https://api.invertironline.com/api/v2/Cotizaciones/BCBA/" + ticker + "/ahora"
+        url  = "https://dolarapi.com/v1/bonos/" + ticker_up
         r    = requests.get(url, timeout=8, headers=headers)
         if r.status_code == 200:
-            data  = r.json()
-            price = data.get("ultimoPrecio") or data.get("ultimo")
-            prev  = data.get("apertura") or data.get("cierreAnterior")
-            if price and prev:
-                price  = float(str(price).replace(",", "."))
-                prev   = float(str(prev).replace(",", "."))
-                change = ((price - prev) / prev) * 100 if prev else 0
-                return {"price": price, "change": round(change, 2), "source": "IOL"}
+            data   = r.json()
+            price  = data.get("precio") or data.get("ultimo") or data.get("compra")
+            change = data.get("variacion") or 0
+            if price:
+                return {"price": float(price), "change": float(change), "source": "DolarAPI"}
     except Exception:
         pass
 
-    # Source 2: Ambito
+    # Source 3: Ambito as last resort
     for endpoint in [
-        "https://mercados.ambito.com/titulo/" + ticker + "/info",
-        "https://mercados.ambito.com/bonos/" + ticker + "/info",
+        "https://mercados.ambito.com/titulo/" + ticker_up + "/info",
+        "https://mercados.ambito.com/bonos/" + ticker_up + "/info",
     ]:
         try:
             r    = requests.get(endpoint, timeout=8, headers=headers)
@@ -256,20 +275,6 @@ def get_bono_price(ticker):
                 return {"price": price, "change": change, "source": "Ambito"}
         except Exception:
             continue
-
-    # Source 3: rava.com
-    try:
-        url  = "https://www.rava.com/perfil/" + ticker
-        r    = requests.get(url, timeout=8, headers=headers)
-        import re as _re
-        m = _re.search(r'"ultimoPrecio"\s*:\s*([\d.,]+)', r.text)
-        v = _re.search(r'"variacion"\s*:\s*(-?[\d.,]+)', r.text)
-        if m:
-            price  = float(m.group(1).replace(",", "."))
-            change = float(v.group(1).replace(",", ".")) if v else 0
-            return {"price": price, "change": change, "source": "Rava"}
-    except Exception:
-        pass
 
     return None
 
@@ -324,7 +329,7 @@ def detect_ar_asset_type(symbol):
         return "dolar_ar"
 
     # Bond heuristic first (AL30, GD35, AE38, etc.)
-    if s in BONOS_AR or s.rstrip("D") in BONOS_AR:
+    if s in BONOS_AR or s in BONOS_YF or s.rstrip("D") in BONOS_AR:
         return "bono"
     if re.match(r'^(AL|GD|AE|TV|PBA|BDC)\d', s):
         return "bono"
