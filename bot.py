@@ -232,269 +232,109 @@ def get_dolar():
     return d
 
 def get_bono_price(ticker):
-    """Fetch Argentine bond price — multiple sources with robust parsing."""
-    ticker_up = ticker.upper()
+    """Fetch Argentine bond price via Open BYMA Data (public, no auth, 20min delay)."""
+    ticker_up = ticker.upper().strip()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "es-AR,es;q=0.9",
-        "Referer": "https://www.rava.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Origin": "https://open.bymadata.com.ar",
+        "Referer": "https://open.bymadata.com.ar/",
     }
 
-    # Source 1: Rava API (most reliable public endpoint for AR bonds)
+    # Source 1: Open BYMA Data - bonos publicos
     try:
-        url = "https://www.rava.com/api/cotizacion?especie=" + ticker_up
-        r   = requests.get(url, timeout=10, headers=headers)
+        payload = {"excludeZeroPxAndQty": False, "T2": True, "T1": False, "T0": False}
+        r = requests.post(
+            "https://open.bymadata.com.ar/vanoms-be-core/rest/api/bymadata/free/bnown/bonds",
+            json=payload, headers=headers, timeout=12
+        )
+        if r.status_code == 200:
+            data = r.json()
+            instruments = data.get("data", []) or data if isinstance(data, list) else []
+            for item in instruments:
+                symbol = (item.get("symbol") or item.get("ticker") or item.get("description") or "").upper()
+                if ticker_up in symbol or symbol.startswith(ticker_up):
+                    price  = item.get("px") or item.get("trade") or item.get("close") or item.get("settlementPrice")
+                    change = item.get("variationRate") or item.get("change") or 0
+                    if price and float(str(price).replace(",", ".")) > 0:
+                        return {
+                            "price":  float(str(price).replace(",", ".")),
+                            "change": round(float(str(change).replace(",", ".").replace("%", "")), 2),
+                            "source": "BYMA"
+                        }
+    except Exception as e:
+        logger.warning("BYMA bonds error: " + str(e))
+
+    # Source 2: Open BYMA Data - general quotes endpoint
+    try:
+        r = requests.get(
+            "https://open.bymadata.com.ar/vanoms-be-core/rest/api/bymadata/free/index-data?index=Titulos+P%C3%BAblicos",
+            headers=headers, timeout=12
+        )
+        if r.status_code == 200:
+            items = r.json()
+            if isinstance(items, dict):
+                items = items.get("data", [])
+            for item in items:
+                sym = (item.get("symbol") or item.get("ticker") or "").upper()
+                if sym == ticker_up or sym.startswith(ticker_up):
+                    price  = item.get("px") or item.get("trade") or item.get("close")
+                    change = item.get("variationRate") or item.get("change") or 0
+                    if price and float(str(price).replace(",", ".")) > 0:
+                        return {
+                            "price":  float(str(price).replace(",", ".")),
+                            "change": round(float(str(change).replace(",", ".")), 2),
+                            "source": "BYMA"
+                        }
+    except Exception as e:
+        logger.warning("BYMA index-data error: " + str(e))
+
+    # Source 3: Ambito API v2
+    try:
+        for url in [
+            "https://mercados.ambito.com//titulo//" + ticker_up + "//variacion",
+            "https://mercados.ambito.com/titulo/" + ticker_up + "/info",
+        ]:
+            r    = requests.get(url, headers=headers, timeout=8)
+            if r.status_code == 200:
+                data  = r.json()
+                price = (data.get("ultimo") or data.get("ultimoPrecio") or
+                         data.get("cotizacion") or data.get("venta"))
+                chg   = data.get("variacion") or data.get("variacionPorcentual") or 0
+                if price:
+                    price = float(str(price).replace(",", ".").replace("$", "").strip())
+                    if price > 0:
+                        return {
+                            "price":  price,
+                            "change": float(str(chg).replace(",", ".").replace("%", "").strip()),
+                            "source": "Ambito"
+                        }
+    except Exception as e:
+        logger.warning("Ambito bono error: " + str(e))
+
+    # Source 4: Rava API
+    try:
+        r = requests.get(
+            "https://www.rava.com/api/cotizacion?especie=" + ticker_up,
+            headers=headers, timeout=8
+        )
         if r.status_code == 200:
             data  = r.json()
             price = data.get("ultimo") or data.get("cierre") or data.get("ultimoPrecio")
             prev  = data.get("cierreAnterior") or data.get("apertura")
             if price:
-                price  = float(str(price).replace(",", "."))
-                change = 0.0
-                if prev:
-                    prev   = float(str(prev).replace(",", "."))
-                    change = ((price - prev) / prev) * 100 if prev else 0
-                return {"price": price, "change": round(change, 2), "source": "Rava"}
-    except Exception as e:
-        logger.warning("Rava bono " + ticker_up + ": " + str(e))
-
-    # Source 2: Ambito mercados
-    for endpoint in [
-        "https://mercados.ambito.com/titulo/" + ticker_up + "/info",
-        "https://mercados.ambito.com/bonos/" + ticker_up + "/info",
-        "https://mercados.ambito.com//titulo//" + ticker_up + "//variacion",
-    ]:
-        try:
-            r    = requests.get(endpoint, timeout=8, headers=headers)
-            if r.status_code != 200:
-                continue
-            data  = r.json()
-            price = (data.get("ultimoPrecio") or data.get("ultimo") or
-                     data.get("cotizacion") or data.get("precio") or
-                     data.get("venta"))
-            change = (data.get("variacion") or data.get("variacionPorcentual") or
-                      data.get("diferencia") or 0)
-            if price:
-                price  = float(str(price).replace(",", ".").replace("%","").replace("$","").strip())
-                change = float(str(change).replace(",", ".").replace("%","").strip())
-                return {"price": price, "change": change, "source": "Ambito"}
-        except Exception:
-            continue
-
-    # Source 3: Cohen (ByMA data, 20min delay)
-    try:
-        url = "https://www.cohen.com.ar/api/Bursatil/Especie/" + ticker_up + "/Cotizacion"
-        r   = requests.get(url, timeout=8, headers=headers)
-        if r.status_code == 200:
-            data  = r.json()
-            price = data.get("ultimoPrecio") or data.get("ultimo") or data.get("precio")
-            change = data.get("variacion") or data.get("variacionPorcentual") or 0
-            if price:
-                return {"price": float(price), "change": float(change), "source": "Cohen"}
-    except Exception:
-        pass
-
-    # Source 4: Scrape Rava page for price
-    try:
-        url  = "https://www.rava.com/perfil/" + ticker_up.lower()
-        r    = requests.get(url, timeout=10, headers=headers)
-        text = r.text
-        import re as _re
-        patterns = [
-            r'"ultimo"\s*:\s*([\d.,]+)',
-            r'"ultimoPrecio"\s*:\s*([\d.,]+)',
-            r'"cierre"\s*:\s*([\d.,]+)',
-            r'class="cotizacion[^"]*"[^>]*>\s*\$?\s*([\d.,]+)',
-        ]
-        for pattern in patterns:
-            m = _re.search(pattern, text)
-            if m:
-                price = float(m.group(1).replace(",", "."))
+                price = float(str(price).replace(",", "."))
                 if price > 0:
-                    return {"price": price, "change": 0.0, "source": "Rava (web)"}
-    except Exception:
-        pass
-
-    return None
-
-def get_ar_stock_price(ticker):
-    """Try Yahoo Finance .BA first, then Ambito."""
-    yf_ticker = AR_STOCKS_YF.get(ticker, ticker + ".BA")
-    data = get_yahoo_data(yf_ticker, "2d")
-    if data and len(data["closes"]) >= 2:
-        curr = data["closes"][-1]
-        prev = data["closes"][-2]
-        return {"price": float(curr), "change": float(((curr - prev) / prev) * 100), "source": "yahoo"}
-    # Fallback Ambito
-    try:
-        url = "https://mercados.ambito.com/acciones/" + ticker + "/info"
-        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        data = r.json()
-        price  = data.get("ultimoPrecio") or data.get("ultimo")
-        change = data.get("variacion") or 0
-        if price:
-            price  = float(str(price).replace(",", "."))
-            change = float(str(change).replace(",", ".").replace("%", ""))
-            return {"price": price, "change": change, "source": "ambito"}
-    except Exception:
-        pass
-    return None
-
-def get_cedear_price(ticker):
-    """CEDEARs via Yahoo Finance .BA"""
-    yf_ticker = CEDEARS_YF.get(ticker, ticker + ".BA")
-    data = get_yahoo_data(yf_ticker, "2d")
-    if data and len(data["closes"]) >= 2:
-        curr = data["closes"][-1]
-        prev = data["closes"][-2]
-        return {"price": float(curr), "change": float(((curr - prev) / prev) * 100), "source": "yahoo"}
-    return None
-
-def detect_ar_asset_type(symbol):
-    """
-    Returns: 'bono', 'on', 'cedear', 'accion_ar', 'dolar_ar', 'adr_usd', or None
-    Explicit suffix rules:
-      GGAL     -> adr_usd  (NYSE, USD)
-      GGAL.BA  -> accion_ar (BCBA, ARS)
-      GGAL.AR  -> accion_ar (BCBA, ARS)
-    """
-    s = symbol.upper()
-
-    # Explicit suffix overrides
-    if s.endswith(".BA") or s.endswith(".AR"):
-        return "accion_ar"
-
-    if s in ["MEP", "CCL", "BLUE", "DOLAR", "USD"]:
-        return "dolar_ar"
-
-    # Bond heuristic first (AL30, GD35, AE38, etc.)
-    if s in BONOS_AR or s in BONOS_YF or s.rstrip("D") in BONOS_AR:
-        return "bono"
-    if re.match(r'^(AL|GD|AE|TV|PBA|BDC)\d', s):
-        return "bono"
-
-    if s in ONS_AR:
-        return "on"
-
-    # CEDEARs only if explicitly in list AND not an ADR
-    if s in CEDEARS_YF and s not in AR_ADRS_USD:
-        return "cedear"
-
-    # ADRs in USD — route as global ticker (USD)
-    if s in AR_ADRS_USD:
-        return "adr_usd"
-
-    # .BA stocks
-    if s in AR_STOCKS_YF:
-        return "accion_ar"
-
-    return None
-
-# ── Claude AI ─────────────────────────────────────────────────────────────────
-
-def ask_claude(prompt, max_tokens=800):
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        data = r.json()
-        return data.get("content", [{}])[0].get("text", "").strip()
+                    change = 0.0
+                    if prev:
+                        prev   = float(str(prev).replace(",", "."))
+                        change = ((price - prev) / prev) * 100 if prev else 0
+                    return {"price": price, "change": round(change, 2), "source": "Rava"}
     except Exception as e:
-        logger.error("Claude error: " + str(e))
-        return ""
+        logger.warning("Rava bono error: " + str(e))
 
-def is_question(text):
-    """Detect if user sent a free-form question rather than a ticker."""
-    words = text.strip().split()
-    if len(words) >= 4:
-        return True
-    question_words = ["que", "qué", "como", "cómo", "cuando", "cuándo", "por", "cual",
-                      "cuál", "explica", "analiza", "contame", "hablame", "describe",
-                      "situacion", "situación", "contexto", "opinion", "opinión"]
-    low = text.lower()
-    for w in question_words:
-        if w in low:
-            return True
-    return False
+    return None
 
-def answer_question(text):
-    """Claude answers a free-form macro/micro financial question."""
-    dolar = get_dolar()
-    dolar_str = ""
-    for name, v in dolar.items():
-        dolar_str += name + ": $" + str(v.get("venta", "")) + " | "
-
-    prompt = (
-        "Sos un analista financiero y economico experto en Argentina y mercados globales de ST Capital. "
-        "El usuario te hace la siguiente consulta:\n\n"
-        "\"" + text + "\"\n\n"
-        "Respondele con un analisis claro, concreto y educativo. "
-        "Incluye contexto macro o micro segun corresponda, menciona variables relevantes "
-        "(tasas, inflacion, tipo de cambio, commodities, politica, etc). "
-        "Si es sobre Argentina, considera el contexto economico actual del pais. "
-        "Maximo 6 oraciones. Tono profesional, en español. Sin markdown ni asteriscos.\n\n"
-        "Datos de referencia actuales - Dolar Argentina: " + dolar_str
-    )
-    return ask_claude(prompt, max_tokens=700)
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def arrow_emoji(chg):
-    return "🟢" if chg >= 0 else "🔴"
-
-def fmt_price(price, decimals=2):
-    if price >= 1000:
-        return "{:,.0f}".format(price)
-    elif price >= 1:
-        return "{:,.{}f}".format(price, decimals)
-    else:
-        return "{:.4f}".format(price)
-
-def fmt_large(val):
-    if val >= 1e12:
-        return "${:.2f}T".format(val / 1e12)
-    elif val >= 1e9:
-        return "${:.2f}B".format(val / 1e9)
-    elif val >= 1e6:
-        return "${:.2f}M".format(val / 1e6)
-    return "${:,.0f}".format(val)
-
-def compute_rsi(closes, period=14):
-    arr      = np.array(closes, dtype=float)
-    deltas   = np.diff(arr)
-    gains    = np.where(deltas > 0, deltas, 0)
-    losses   = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-def compute_rs_score(ticker_closes, spy_closes):
-    n = min(63, len(ticker_closes), len(spy_closes))
-    if n < 2:
-        return 0.0
-    ticker_ret = (ticker_closes[-1] / ticker_closes[-n]) - 1
-    spy_ret    = (spy_closes[-1]    / spy_closes[-n])    - 1
-    return round((ticker_ret - spy_ret) * 100, 2)
-
-def pct_from_ma(current, ma):
-    return round(((current - ma) / ma) * 100, 2)
-
-# ── Argentine ticker analysis ─────────────────────────────────────────────────
 
 def analyze_ar_dolar():
     dolar = get_dolar()
