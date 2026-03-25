@@ -232,49 +232,89 @@ def get_dolar():
     return d
 
 def get_bono_price(ticker):
-    """Fetch Argentine bond price — Yahoo Finance .BA as primary, dolarapi as fallback."""
+    """Fetch Argentine bond price — multiple sources with robust parsing."""
     ticker_up = ticker.upper()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "es-AR,es;q=0.9",
+        "Referer": "https://www.rava.com/",
+    }
 
-    # Source 1: Yahoo Finance .BA (most reliable for Railway)
-    yf_ticker = BONOS_YF.get(ticker_up, ticker_up + ".BA")
-    data = get_yahoo_data(yf_ticker, "2d")
-    if data and len(data["closes"]) >= 1:
-        curr  = data["closes"][-1]
-        prev  = data["closes"][-2] if len(data["closes"]) >= 2 else curr
-        chg   = ((curr - prev) / prev) * 100 if prev else 0
-        return {"price": float(curr), "change": round(float(chg), 2), "source": "Yahoo .BA"}
-
-    # Source 2: dolarapi.com bonos endpoint
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    # Source 1: Rava API (most reliable public endpoint for AR bonds)
     try:
-        url  = "https://dolarapi.com/v1/bonos/" + ticker_up
-        r    = requests.get(url, timeout=8, headers=headers)
+        url = "https://www.rava.com/api/cotizacion?especie=" + ticker_up
+        r   = requests.get(url, timeout=10, headers=headers)
         if r.status_code == 200:
-            data   = r.json()
-            price  = data.get("precio") or data.get("ultimo") or data.get("compra")
-            change = data.get("variacion") or 0
+            data  = r.json()
+            price = data.get("ultimo") or data.get("cierre") or data.get("ultimoPrecio")
+            prev  = data.get("cierreAnterior") or data.get("apertura")
             if price:
-                return {"price": float(price), "change": float(change), "source": "DolarAPI"}
-    except Exception:
-        pass
+                price  = float(str(price).replace(",", "."))
+                change = 0.0
+                if prev:
+                    prev   = float(str(prev).replace(",", "."))
+                    change = ((price - prev) / prev) * 100 if prev else 0
+                return {"price": price, "change": round(change, 2), "source": "Rava"}
+    except Exception as e:
+        logger.warning("Rava bono " + ticker_up + ": " + str(e))
 
-    # Source 3: Ambito as last resort
+    # Source 2: Ambito mercados
     for endpoint in [
         "https://mercados.ambito.com/titulo/" + ticker_up + "/info",
         "https://mercados.ambito.com/bonos/" + ticker_up + "/info",
+        "https://mercados.ambito.com//titulo//" + ticker_up + "//variacion",
     ]:
         try:
             r    = requests.get(endpoint, timeout=8, headers=headers)
-            data = r.json()
+            if r.status_code != 200:
+                continue
+            data  = r.json()
             price = (data.get("ultimoPrecio") or data.get("ultimo") or
-                     data.get("cotizacion") or data.get("precio"))
-            change = data.get("variacion") or data.get("variacionPorcentual") or 0
+                     data.get("cotizacion") or data.get("precio") or
+                     data.get("venta"))
+            change = (data.get("variacion") or data.get("variacionPorcentual") or
+                      data.get("diferencia") or 0)
             if price:
                 price  = float(str(price).replace(",", ".").replace("%","").replace("$","").strip())
                 change = float(str(change).replace(",", ".").replace("%","").strip())
                 return {"price": price, "change": change, "source": "Ambito"}
         except Exception:
             continue
+
+    # Source 3: Cohen (ByMA data, 20min delay)
+    try:
+        url = "https://www.cohen.com.ar/api/Bursatil/Especie/" + ticker_up + "/Cotizacion"
+        r   = requests.get(url, timeout=8, headers=headers)
+        if r.status_code == 200:
+            data  = r.json()
+            price = data.get("ultimoPrecio") or data.get("ultimo") or data.get("precio")
+            change = data.get("variacion") or data.get("variacionPorcentual") or 0
+            if price:
+                return {"price": float(price), "change": float(change), "source": "Cohen"}
+    except Exception:
+        pass
+
+    # Source 4: Scrape Rava page for price
+    try:
+        url  = "https://www.rava.com/perfil/" + ticker_up.lower()
+        r    = requests.get(url, timeout=10, headers=headers)
+        text = r.text
+        import re as _re
+        patterns = [
+            r'"ultimo"\s*:\s*([\d.,]+)',
+            r'"ultimoPrecio"\s*:\s*([\d.,]+)',
+            r'"cierre"\s*:\s*([\d.,]+)',
+            r'class="cotizacion[^"]*"[^>]*>\s*\$?\s*([\d.,]+)',
+        ]
+        for pattern in patterns:
+            m = _re.search(pattern, text)
+            if m:
+                price = float(m.group(1).replace(",", "."))
+                if price > 0:
+                    return {"price": price, "change": 0.0, "source": "Rava (web)"}
+    except Exception:
+        pass
 
     return None
 
