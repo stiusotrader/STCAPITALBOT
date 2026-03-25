@@ -1,10 +1,9 @@
 import os
-import asyncio
 import logging
 from datetime import datetime
 import pytz
 import numpy as np
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import yfinance as yf
@@ -53,8 +52,7 @@ CRYPTO_IDS = {
     "BNB":      "binancecoin",
 }
  
-def arrow(chg):
-    return "UP" if chg >= 0 else "DN"
+# ── Helpers ───────────────────────────────────────────────────────────────────
  
 def arrow_emoji(chg):
     return "🟢" if chg >= 0 else "🔴"
@@ -98,6 +96,8 @@ def compute_rs_score(ticker_closes, spy_closes):
 def pct_from_ma(current, ma):
     return round(((current - ma) / ma) * 100, 2)
  
+# ── Ticker analysis ───────────────────────────────────────────────────────────
+ 
 def analyze_ticker(symbol):
     symbol = symbol.upper().strip()
     try:
@@ -105,7 +105,7 @@ def analyze_ticker(symbol):
         hist = t.history(period="1y")
  
         if hist.empty or len(hist) < 20:
-            return "No encontre datos para " + symbol + ". Verifica el ticker e intenta de nuevo."
+            return "No encontre datos para " + symbol + ". Verifica el ticker."
  
         closes  = hist["Close"].values
         volumes = hist["Volume"].values
@@ -116,13 +116,15 @@ def analyze_ticker(symbol):
  
         rsi = compute_rsi(closes) if len(closes) >= 16 else None
  
+        rs_score = None
         try:
             spy_hist   = yf.Ticker("SPY").history(period="1y")
             spy_closes = spy_hist["Close"].values
             rs_score   = compute_rs_score(closes, spy_closes)
         except Exception:
-            rs_score = None
+            pass
  
+        ema200 = dist_ema200 = None
         if len(closes) >= 200:
             ema = closes[0]
             k   = 2 / (200 + 1)
@@ -130,14 +132,11 @@ def analyze_ticker(symbol):
                 ema = c * k + ema * (1 - k)
             ema200      = round(float(ema), 2)
             dist_ema200 = pct_from_ma(current, ema200)
-        else:
-            ema200 = dist_ema200 = None
  
+        sma50 = dist_sma50 = None
         if len(closes) >= 50:
             sma50      = round(float(np.mean(closes[-50:])), 2)
             dist_sma50 = pct_from_ma(current, sma50)
-        else:
-            sma50 = dist_sma50 = None
  
         high_52w      = round(float(np.max(closes)), 2)
         low_52w       = round(float(np.min(closes)), 2)
@@ -169,61 +168,45 @@ def analyze_ticker(symbol):
         if sector:
             lines.append("_" + sector + " - " + industry + "_")
         lines.append("")
- 
-        chg_str = "{:+.2f}".format(day_chg) + "%"
-        lines.append(arrow_emoji(day_chg) + " *Price:* $" + fmt_price(current) + "  " + chg_str)
- 
+        lines.append(arrow_emoji(day_chg) + " *Price:* $" + fmt_price(current) + "  " + "{:+.2f}".format(day_chg) + "%")
         if mktcap:
             lines.append("🏦 *Market Cap:* " + fmt_large(mktcap))
- 
         lines.append("")
         lines.append("*Indicadores tecnicos*")
- 
         if rsi is not None:
-            rsi_tag = ""
-            if rsi >= 70:   rsi_tag = " - Sobrecomprado"
-            elif rsi <= 30: rsi_tag = " - Sobrevendido"
-            lines.append("📉 *RSI 14:* " + str(rsi) + rsi_tag)
- 
+            tag = " - Sobrecomprado" if rsi >= 70 else (" - Sobrevendido" if rsi <= 30 else "")
+            lines.append("📉 *RSI 14:* " + str(rsi) + tag)
         if rs_score is not None:
-            rs_tag = ""
-            if rs_score > 10:   rs_tag = " - Fuerte vs mercado"
-            elif rs_score < -10: rs_tag = " - Debil vs mercado"
-            else:                rs_tag = " - Neutral"
-            lines.append("⚡ *RS Score vs SPY:* " + "{:+.2f}".format(rs_score) + "%" + rs_tag)
- 
-        if ema200 is not None and dist_ema200 is not None:
-            lines.append(arrow_emoji(dist_ema200) + " *Dist EMA 200:* " + "{:+.2f}".format(dist_ema200) + "%  (EMA: $" + fmt_price(ema200) + ")")
- 
-        if sma50 is not None and dist_sma50 is not None:
-            lines.append(arrow_emoji(dist_sma50) + " *Dist SMA 50:* " + "{:+.2f}".format(dist_sma50) + "%  (SMA: $" + fmt_price(sma50) + ")")
- 
+            tag = " - Fuerte vs mercado" if rs_score > 10 else (" - Debil vs mercado" if rs_score < -10 else " - Neutral")
+            lines.append("⚡ *RS Score vs SPY:* " + "{:+.2f}".format(rs_score) + "%" + tag)
+        if ema200 is not None:
+            lines.append(arrow_emoji(dist_ema200) + " *Dist EMA 200:* " + "{:+.2f}".format(dist_ema200) + "% (EMA: $" + fmt_price(ema200) + ")")
+        if sma50 is not None:
+            lines.append(arrow_emoji(dist_sma50) + " *Dist SMA 50:* " + "{:+.2f}".format(dist_sma50) + "% (SMA: $" + fmt_price(sma50) + ")")
         lines.append("")
         lines.append("*52W Range*")
         lines.append("📈 *MAX 52W:* $" + fmt_price(high_52w) + "  (" + "{:+.2f}".format(dist_52w_high) + "% del maximo)")
-        lines.append("📉 *MIN 52W:* $" + fmt_price(low_52w)  + "  (" + "{:+.2f}".format(dist_52w_low)  + "% del minimo)")
- 
+        lines.append("📉 *MIN 52W:* $" + fmt_price(low_52w) + "  (" + "{:+.2f}".format(dist_52w_low) + "% del minimo)")
         lines.append("")
         lines.append("*Volumen*")
         vol_emoji = "🔥" if vol_ratio > 1.5 else ("📊" if vol_ratio >= 0.8 else "😴")
         lines.append(vol_emoji + " *Vol ultimo dia:* " + "{:,}".format(vol_last))
-        lines.append("📊 *Vol promedio 20d:* " + "{:,}".format(vol_avg20) + "  (ratio: " + str(vol_ratio) + "x)")
- 
+        lines.append("📊 *Vol promedio 20d:* " + "{:,}".format(vol_avg20) + " (ratio: " + str(vol_ratio) + "x)")
         if news_headlines:
             lines.append("")
             lines.append("*Ultimas noticias*")
             for h in news_headlines:
                 lines.append("- " + h)
- 
         lines.append("")
-        lines.append("_ST Capital - @capitalst_bot_")
-        lines.append("_No es asesoramiento financiero._")
+        lines.append("_ST Capital - No es asesoramiento financiero._")
  
         return "\n".join(lines)
  
     except Exception as e:
-        logger.error("analyze_ticker error for " + symbol + ": " + str(e))
-        return "Error analizando " + symbol + ". Intenta de nuevo en unos segundos."
+        logger.error("analyze_ticker error: " + str(e))
+        return "Error analizando " + symbol + ". Intenta de nuevo."
+ 
+# ── Market data ───────────────────────────────────────────────────────────────
  
 def fetch_yf(symbols):
     results = {}
@@ -234,8 +217,7 @@ def fetch_yf(symbols):
             if len(hist) >= 2:
                 prev = hist["Close"].iloc[-2]
                 curr = hist["Close"].iloc[-1]
-                chg  = ((curr - prev) / prev) * 100
-                results[name] = {"price": float(curr), "change": float(chg)}
+                results[name] = {"price": float(curr), "change": float(((curr - prev) / prev) * 100)}
             elif len(hist) == 1:
                 results[name] = {"price": float(hist["Close"].iloc[-1]), "change": 0.0}
         except Exception as e:
@@ -245,13 +227,9 @@ def fetch_yf(symbols):
 def fetch_crypto():
     try:
         ids  = ",".join(CRYPTO_IDS.values())
-        url  = "https://api.coingecko.com/api/v3/simple/price?ids=" + ids + "&vs_currencies=usd&include_24hr_change=true"
-        r    = requests.get(url, timeout=10)
+        r    = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=" + ids + "&vs_currencies=usd&include_24hr_change=true", timeout=10)
         data = r.json()
-        return {
-            name: {"price": data[cid]["usd"], "change": data[cid].get("usd_24h_change", 0)}
-            for name, cid in CRYPTO_IDS.items() if cid in data
-        }
+        return {name: {"price": data[cid]["usd"], "change": data[cid].get("usd_24h_change", 0)} for name, cid in CRYPTO_IDS.items() if cid in data}
     except Exception as e:
         logger.warning("Crypto error: " + str(e))
         return {}
@@ -260,11 +238,9 @@ def fetch_news(query, count=4):
     if not NEWS_API_KEY:
         return []
     try:
-        url = "https://newsapi.org/v2/everything?q=" + query + "&language=en&sortBy=publishedAt&pageSize=" + str(count) + "&apiKey=" + NEWS_API_KEY
-        r   = requests.get(url, timeout=10)
+        r = requests.get("https://newsapi.org/v2/everything?q=" + query + "&language=en&sortBy=publishedAt&pageSize=" + str(count) + "&apiKey=" + NEWS_API_KEY, timeout=10)
         return [a["title"] for a in r.json().get("articles", []) if a.get("title")]
-    except Exception as e:
-        logger.warning("News error: " + str(e))
+    except Exception:
         return []
  
 def section(title, data, decimals=2):
@@ -272,121 +248,140 @@ def section(title, data, decimals=2):
         return ""
     lines = ["\n" + title]
     for name, v in data.items():
-        p   = fmt_price(v["price"], decimals)
-        chg = v["change"]
-        em  = "🟢" if chg >= 0 else "🔴"
-        lines.append(em + " *" + name + "*: $" + p + "  (" + "{:+.2f}".format(chg) + "%)")
+        lines.append(arrow_emoji(v["change"]) + " *" + name + "*: $" + fmt_price(v["price"], decimals) + "  (" + "{:+.2f}".format(v["change"]) + "%)")
     return "\n".join(lines)
  
+# ── Message builders ──────────────────────────────────────────────────────────
+ 
 def build_opening():
-    now  = datetime.now(TZ).strftime("%A %d %b %Y")
-    msg  = "🌅 *APERTURA DE MERCADOS - ST Capital*\n_" + now + "_\n"
+    now = datetime.now(TZ).strftime("%A %d %b %Y")
+    msg = "🌅 *APERTURA - ST Capital*\n_" + now + "_\n"
     msg += section("📊 *INDICES GLOBALES*", fetch_yf(INDICES))
     msg += section("🪙 *CRYPTO*", fetch_crypto(), decimals=0)
     msg += section("🛢 *COMMODITIES*", fetch_yf(COMMODITIES))
     news = fetch_news("markets stocks economy", 4)
     if news:
-        msg += "\n\n📰 *NOTICIAS DE LA MANANA*"
+        msg += "\n\n📰 *NOTICIAS*"
         for n in news[:4]: msg += "\n- " + n
-    msg += "\n\n_ST Capital - @capitalst_bot_"
+    msg += "\n\n_ST Capital_"
     return msg
  
 def build_midmorning():
-    msg  = "📊 *MID-MORNING UPDATE - ST Capital*\n"
+    msg = "📊 *MID-MORNING - ST Capital*\n"
     msg += section("📈 *INDICES*", fetch_yf(INDICES))
     msg += section("🏢 *US STOCKS*", fetch_yf(US_STOCKS))
     news = fetch_news("stock market Wall Street", 3)
     if news:
-        msg += "\n\n📰 *ULTIMAS NOTICIAS*"
+        msg += "\n\n📰 *NOTICIAS*"
         for n in news[:3]: msg += "\n- " + n
-    msg += "\n\n_ST Capital - @capitalst_bot_"
+    msg += "\n\n_ST Capital_"
     return msg
  
 def build_midday():
-    msg  = "🔴 *MEDIODIA - ST Capital*\n"
+    msg = "🔴 *MEDIODIA - ST Capital*\n"
     msg += section("🛢 *COMMODITIES*", fetch_yf(COMMODITIES))
     msg += section("💱 *FOREX*", fetch_yf(FOREX), decimals=4)
     msg += section("🪙 *CRYPTO*", fetch_crypto(), decimals=0)
     news = fetch_news("commodity oil gold forex", 3)
     if news:
-        msg += "\n\n📰 *NOTICIAS MACRO*"
+        msg += "\n\n📰 *NOTICIAS*"
         for n in news[:3]: msg += "\n- " + n
-    msg += "\n\n_ST Capital - @capitalst_bot_"
+    msg += "\n\n_ST Capital_"
     return msg
  
 def build_preclose():
-    msg  = "📈 *PRE-CIERRE USA - ST Capital*\n"
+    msg = "📈 *PRE-CIERRE USA - ST Capital*\n"
     msg += section("🏢 *US STOCKS*", fetch_yf(US_STOCKS))
     msg += section("📊 *INDICES USA*", fetch_yf({"S&P 500": "^GSPC", "Nasdaq": "^IXIC", "Dow Jones": "^DJI"}))
-    news = fetch_news("earnings stocks Wall Street close", 3)
+    news = fetch_news("earnings stocks Wall Street", 3)
     if news:
-        msg += "\n\n📰 *NOTICIAS PRE-CIERRE*"
+        msg += "\n\n📰 *NOTICIAS*"
         for n in news[:3]: msg += "\n- " + n
-    msg += "\n\n_ST Capital - @capitalst_bot_"
+    msg += "\n\n_ST Capital_"
     return msg
  
 def build_close():
-    msg  = "🌙 *CIERRE DEL DIA - ST Capital*\n"
-    msg += section("📊 *INDICES GLOBALES*", fetch_yf(INDICES))
+    msg = "🌙 *CIERRE DEL DIA - ST Capital*\n"
+    msg += section("📊 *INDICES*", fetch_yf(INDICES))
     msg += section("🏢 *US STOCKS*", fetch_yf(US_STOCKS))
     msg += section("🛢 *COMMODITIES*", fetch_yf(COMMODITIES))
     msg += section("🪙 *CRYPTO*", fetch_crypto(), decimals=0)
-    msg += "\n\n_Eso fue todo por hoy. Hasta manana_"
-    msg += "\n_ST Capital - @capitalst_bot_"
+    msg += "\n\n_ST Capital - Hasta manana_"
     return msg
+ 
+# ── Global app reference ──────────────────────────────────────────────────────
+ 
+APP = None
+ 
+def scheduled_send(builder_fn):
+    if APP is None:
+        return
+    try:
+        text = builder_fn()
+        import asyncio
+        loop = APP.bot._application.update_queue._loop if hasattr(APP, '_loop') else None
+        asyncio.run_coroutine_threadsafe(
+            APP.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown", disable_web_page_preview=True),
+            APP.bot._httpx_client._transport._pool._ssl_context._loop if False else asyncio.get_event_loop()
+        )
+    except Exception as e:
+        logger.error("Scheduled send error: " + str(e))
+ 
+# ── Handlers ──────────────────────────────────────────────────────────────────
  
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    user_id = str(update.effective_user.id)
-    if user_id != str(CHAT_ID):
+    if str(update.effective_user.id) != str(CHAT_ID):
         return
  
-    text = update.message.text.strip()
- 
-    if text.lower() in ["/start", "/help", "help", "ayuda"]:
-        await update.message.reply_text(
-            "ST Capital Bot\n\nEscribime el ticker de cualquier activo:\n"
-            "AAPL, BTC-USD, GC=F, SPY, TSLA, ETH-USD...",
-            parse_mode=None
-        )
-        return
- 
+    text   = update.message.text.strip()
     symbol = text.upper().replace(" ", "").lstrip("/")
+ 
+    if symbol in ["START", "HELP", "AYUDA"]:
+        await update.message.reply_text("ST Capital Bot\n\nEscribime cualquier ticker:\nAAPL, BTC-USD, GC=F, SPY, TSLA...")
+        return
+ 
     await update.message.reply_text("Analizando " + symbol + "...")
  
+    import asyncio
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, analyze_ticker, symbol)
     await update.message.reply_text(result, parse_mode="Markdown", disable_web_page_preview=True)
  
-async def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT, handle_message))
+# ── Main ──────────────────────────────────────────────────────────────────────
  
-    scheduler = AsyncIOScheduler(timezone=TZ)
+def main():
+    global APP
+    APP = Application.builder().token(TELEGRAM_TOKEN).build()
+    APP.add_handler(MessageHandler(filters.TEXT, handle_message))
  
-    async def send_msg(builder_fn):
-        try:
-            text = builder_fn()
-            await app.bot.send_message(
-                chat_id=CHAT_ID,
-                text=text,
-                parse_mode="Markdown",
-                disable_web_page_preview=True
-            )
-        except Exception as e:
-            logger.error("Scheduled send error: " + str(e))
+    scheduler = BackgroundScheduler(timezone=TZ)
  
-    scheduler.add_job(lambda: asyncio.ensure_future(send_msg(build_opening)),    "cron", hour=9,  minute=0)
-    scheduler.add_job(lambda: asyncio.ensure_future(send_msg(build_midmorning)), "cron", hour=11, minute=0)
-    scheduler.add_job(lambda: asyncio.ensure_future(send_msg(build_midday)),     "cron", hour=13, minute=0)
-    scheduler.add_job(lambda: asyncio.ensure_future(send_msg(build_preclose)),   "cron", hour=15, minute=0)
-    scheduler.add_job(lambda: asyncio.ensure_future(send_msg(build_close)),      "cron", hour=17, minute=0)
+    def make_job(fn):
+        def job():
+            try:
+                text = fn()
+                import asyncio
+                future = asyncio.run_coroutine_threadsafe(
+                    APP.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown", disable_web_page_preview=True),
+                    APP.bot._httpx_client._transport._pool._loop if False else APP.update_queue._loop
+                )
+                future.result(timeout=30)
+            except Exception as e:
+                logger.error("Job error: " + str(e))
+        return job
+ 
+    scheduler.add_job(make_job(build_opening),    "cron", hour=9,  minute=0)
+    scheduler.add_job(make_job(build_midmorning), "cron", hour=11, minute=0)
+    scheduler.add_job(make_job(build_midday),     "cron", hour=13, minute=0)
+    scheduler.add_job(make_job(build_preclose),   "cron", hour=15, minute=0)
+    scheduler.add_job(make_job(build_close),      "cron", hour=17, minute=0)
  
     scheduler.start()
-    logger.info("ST Capital Bot running - scheduled + on-demand active.")
+    logger.info("ST Capital Bot running.")
  
-    await app.run_polling(drop_pending_updates=True)
+    APP.run_polling(drop_pending_updates=True)
  
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
