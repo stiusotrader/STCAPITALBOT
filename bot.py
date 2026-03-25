@@ -232,91 +232,80 @@ def get_dolar():
     return d
 
 def get_bono_price(ticker):
-    """Fetch Argentine bond price via Open BYMA Data (public, no auth, 20min delay)."""
+    """Fetch Argentine bond price — PPI as primary, Ambito/Rava as fallback."""
     ticker_up = ticker.upper().strip()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Origin": "https://open.bymadata.com.ar",
-        "Referer": "https://open.bymadata.com.ar/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-AR,es;q=0.9",
     }
 
-    # Source 1: Open BYMA Data - bonos publicos
+    # Source 1: PPI (portfoliopersonal.com) — public page, no auth needed
     try:
-        payload = {"excludeZeroPxAndQty": False, "T2": True, "T1": False, "T0": False}
-        r = requests.post(
-            "https://open.bymadata.com.ar/vanoms-be-core/rest/api/bymadata/free/bnown/bonds",
-            json=payload, headers=headers, timeout=12
-        )
+        url = "https://www.portfoliopersonal.com/Cotizaciones/Bonos"
+        r   = requests.get(url, headers=headers, timeout=15)
         if r.status_code == 200:
-            data = r.json()
-            instruments = data.get("data", []) or data if isinstance(data, list) else []
-            for item in instruments:
-                symbol = (item.get("symbol") or item.get("ticker") or item.get("description") or "").upper()
-                if ticker_up in symbol or symbol.startswith(ticker_up):
-                    price  = item.get("px") or item.get("trade") or item.get("close") or item.get("settlementPrice")
-                    change = item.get("variationRate") or item.get("change") or 0
-                    if price and float(str(price).replace(",", ".")) > 0:
-                        return {
-                            "price":  float(str(price).replace(",", ".")),
-                            "change": round(float(str(change).replace(",", ".").replace("%", "")), 2),
-                            "source": "BYMA"
-                        }
+            import re as _re
+            # Pattern: ticker in brackets like [AL30] followed by price and variation
+            # HTML has: AL30 ... AR$ 85.860,00 | -0,51%
+            text = r.text
+            # Find the row containing our ticker
+            pattern = r'\[' + ticker_up + r'\][^|]*?\|\s*([\w$\s]+?[\d.,]+)[^|]*?\|\s*(-?[\d.,]+)%'
+            # Simpler: find ticker then grab next price
+            idx = text.find('>' + ticker_up + '<')
+            if idx == -1:
+                idx = text.find('[' + ticker_up + ']')
+            if idx > 0:
+                # Search for price pattern near the ticker
+                snippet = text[idx:idx+500]
+                # Match AR$ or US$ price
+                m_price = _re.search(r'(?:AR\$|US\$)\s*([\d.,]+)', snippet)
+                m_var   = _re.search(r'(-?[\d.,]+)%', snippet)
+                if m_price:
+                    raw = m_price.group(1).replace('.', '').replace(',', '.')
+                    price = float(raw)
+                    change = 0.0
+                    if m_var:
+                        change = float(m_var.group(1).replace(',', '.'))
+                    if price > 0:
+                        return {"price": price, "change": change, "source": "PPI"}
     except Exception as e:
-        logger.warning("BYMA bonds error: " + str(e))
+        logger.warning("PPI scrape error: " + str(e))
 
-    # Source 2: Open BYMA Data - general quotes endpoint
-    try:
-        r = requests.get(
-            "https://open.bymadata.com.ar/vanoms-be-core/rest/api/bymadata/free/index-data?index=Titulos+P%C3%BAblicos",
-            headers=headers, timeout=12
-        )
-        if r.status_code == 200:
-            items = r.json()
-            if isinstance(items, dict):
-                items = items.get("data", [])
-            for item in items:
-                sym = (item.get("symbol") or item.get("ticker") or "").upper()
-                if sym == ticker_up or sym.startswith(ticker_up):
-                    price  = item.get("px") or item.get("trade") or item.get("close")
-                    change = item.get("variationRate") or item.get("change") or 0
-                    if price and float(str(price).replace(",", ".")) > 0:
-                        return {
-                            "price":  float(str(price).replace(",", ".")),
-                            "change": round(float(str(change).replace(",", ".")), 2),
-                            "source": "BYMA"
-                        }
-    except Exception as e:
-        logger.warning("BYMA index-data error: " + str(e))
-
-    # Source 3: Ambito API v2
-    try:
-        for url in [
-            "https://mercados.ambito.com//titulo//" + ticker_up + "//variacion",
-            "https://mercados.ambito.com/titulo/" + ticker_up + "/info",
-        ]:
-            r    = requests.get(url, headers=headers, timeout=8)
+    # Source 2: Ambito variacion endpoint
+    headers2 = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.ambito.com/",
+    }
+    for url in [
+        "https://mercados.ambito.com//titulo//" + ticker_up + "//variacion",
+        "https://mercados.ambito.com/titulo/" + ticker_up + "/info",
+    ]:
+        try:
+            r = requests.get(url, headers=headers2, timeout=8)
             if r.status_code == 200:
                 data  = r.json()
                 price = (data.get("ultimo") or data.get("ultimoPrecio") or
-                         data.get("cotizacion") or data.get("venta"))
+                         data.get("cotizacion") or data.get("venta") or
+                         data.get("precio"))
                 chg   = data.get("variacion") or data.get("variacionPorcentual") or 0
                 if price:
-                    price = float(str(price).replace(",", ".").replace("$", "").strip())
+                    price = float(str(price).replace(",", ".").replace("$","").strip())
                     if price > 0:
                         return {
                             "price":  price,
-                            "change": float(str(chg).replace(",", ".").replace("%", "").strip()),
+                            "change": float(str(chg).replace(",",".").replace("%","").strip()),
                             "source": "Ambito"
                         }
-    except Exception as e:
-        logger.warning("Ambito bono error: " + str(e))
+        except Exception:
+            continue
 
-    # Source 4: Rava API
+    # Source 3: Rava API
     try:
         r = requests.get(
             "https://www.rava.com/api/cotizacion?especie=" + ticker_up,
-            headers=headers, timeout=8
+            headers=headers2, timeout=8
         )
         if r.status_code == 200:
             data  = r.json()
