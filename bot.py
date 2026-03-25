@@ -336,6 +336,137 @@ def get_bono_price(ticker):
     return None
 
 
+def get_ar_stock_price(ticker):
+    """Try Yahoo Finance .BA first, then Ambito."""
+    yf_ticker = AR_STOCKS_YF.get(ticker, ticker + ".BA")
+    data = get_yahoo_data(yf_ticker, "2d")
+    if data and len(data["closes"]) >= 2:
+        curr = data["closes"][-1]
+        prev = data["closes"][-2]
+        return {"price": float(curr), "change": float(((curr - prev) / prev) * 100), "source": "yahoo"}
+    # Fallback Ambito
+    try:
+        url = "https://mercados.ambito.com/acciones/" + ticker + "/info"
+        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        data = r.json()
+        price  = data.get("ultimoPrecio") or data.get("ultimo")
+        change = data.get("variacion") or 0
+        if price:
+            price  = float(str(price).replace(",", "."))
+            change = float(str(change).replace(",", ".").replace("%", ""))
+            return {"price": price, "change": change, "source": "ambito"}
+    except Exception:
+        pass
+    return None
+
+def get_cedear_price(ticker):
+    """CEDEARs via Yahoo Finance .BA"""
+    yf_ticker = CEDEARS_YF.get(ticker, ticker + ".BA")
+    data = get_yahoo_data(yf_ticker, "2d")
+    if data and len(data["closes"]) >= 2:
+        curr = data["closes"][-1]
+        prev = data["closes"][-2]
+        return {"price": float(curr), "change": float(((curr - prev) / prev) * 100), "source": "yahoo"}
+    return None
+
+def detect_ar_asset_type(symbol):
+    """
+    Returns: 'bono', 'on', 'cedear', 'accion_ar', 'dolar_ar', 'adr_usd', or None
+    Explicit suffix rules:
+      GGAL     -> adr_usd  (NYSE, USD)
+      GGAL.BA  -> accion_ar (BCBA, ARS)
+      GGAL.AR  -> accion_ar (BCBA, ARS)
+    """
+    s = symbol.upper()
+
+    # Explicit suffix overrides
+    if s.endswith(".BA") or s.endswith(".AR"):
+        return "accion_ar"
+
+    if s in ["MEP", "CCL", "BLUE", "DOLAR", "USD"]:
+        return "dolar_ar"
+
+    # Bond heuristic first (AL30, GD35, AE38, etc.)
+    if s in BONOS_AR or s in BONOS_YF or s.rstrip("D") in BONOS_AR:
+        return "bono"
+    if re.match(r'^(AL|GD|AE|TV|PBA|BDC)\d', s):
+        return "bono"
+
+    if s in ONS_AR:
+        return "on"
+
+    # CEDEARs only if explicitly in list AND not an ADR
+    if s in CEDEARS_YF and s not in AR_ADRS_USD:
+        return "cedear"
+
+    # ADRs in USD — route as global ticker (USD)
+    if s in AR_ADRS_USD:
+        return "adr_usd"
+
+    # .BA stocks
+    if s in AR_STOCKS_YF:
+        return "accion_ar"
+
+    return None
+
+# ── Claude AI ─────────────────────────────────────────────────────────────────
+
+def ask_claude(prompt, max_tokens=800):
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        data = r.json()
+        return data.get("content", [{}])[0].get("text", "").strip()
+    except Exception as e:
+        logger.error("Claude error: " + str(e))
+        return ""
+
+def is_question(text):
+    """Detect if user sent a free-form question rather than a ticker."""
+    words = text.strip().split()
+    if len(words) >= 4:
+        return True
+    question_words = ["que", "qué", "como", "cómo", "cuando", "cuándo", "por", "cual",
+                      "cuál", "explica", "analiza", "contame", "hablame", "describe",
+                      "situacion", "situación", "contexto", "opinion", "opinión"]
+    low = text.lower()
+    for w in question_words:
+        if w in low:
+            return True
+    return False
+
+def answer_question(text):
+    """Claude answers a free-form macro/micro financial question."""
+    dolar = get_dolar()
+    dolar_str = ""
+    for name, v in dolar.items():
+        dolar_str += name + ": $" + str(v.get("venta", "")) + " | "
+
+    prompt = (
+        "Sos un analista financiero y economico experto en Argentina y mercados globales de ST Capital. "
+        "El usuario te hace la siguiente consulta:\n\n"
+        "\"" + text + "\"\n\n"
+        "Respondele con un analisis claro, concreto y educativo. "
+        "Incluye contexto macro o micro segun corresponda, menciona variables relevantes "
+        "(tasas, inflacion, tipo de cambio, commodities, politica, etc). "
+        "Si es sobre Argentina, considera el contexto economico actual del pais. "
+        "Maximo 6 oraciones. Tono profesional, en español. Sin markdown ni asteriscos.\n\n"
+        "Datos de referencia actuales - Dolar Argentina: " + dolar_str
+    )
+    return ask_claude(prompt, max_tokens=700)
+
 def analyze_ar_dolar():
     dolar = get_dolar()
     if not dolar:
