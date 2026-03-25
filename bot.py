@@ -236,12 +236,25 @@ def analyze_ticker(symbol):
         + "Volumen ratio vs 20d: " + str(vol_ratio) + "x\n"
     )
  
+    # Fetch recent news for this specific ticker
+    ticker_news = fetch_news(name + " " + symbol + " stock", 4)
+    ticker_news_text = "\n".join(ticker_news[:4]) if ticker_news else "Sin noticias recientes disponibles."
+ 
     claude_analysis = ask_claude(
-        "Sos un analista financiero experto. Con los siguientes datos tecnicos de " + name + ", "
-        "escribi un analisis breve (3-4 oraciones) en español sobre el estado actual del activo, "
-        "destacando lo mas relevante para un trader. Se directo, concreto y profesional. "
-        "No uses markdown, no uses asteriscos, no uses guiones al inicio.\n\n"
-        + tech_summary
+        "Sos un analista financiero senior de ST Capital. Te piden un analisis completo de " + name + " (" + symbol + ").\n\n"
+        "Escribi DOS secciones separadas por una linea en blanco:\n\n"
+        "SECCION 1 - CONTEXTO GLOBAL (3-4 oraciones):\n"
+        "Explica que es este activo, que rol cumple a nivel mundial, y cuales son las principales "
+        "variables macro, geopoliticas o sectoriales que afectan su precio hoy. "
+        "Menciona factores como tasas de interes, competencia, regulacion, demanda global, ciclo economico "
+        "o cualquier driver especifico del activo. Se concreto y educativo.\n\n"
+        "SECCION 2 - ANALISIS TECNICO (3-4 oraciones):\n"
+        "Con los datos tecnicos provistos, describe la tendencia actual, si esta en zona de soporte o resistencia, "
+        "que dicen el RSI y las medias moviles sobre el momentum, y una conclusion sobre el momento del activo.\n\n"
+        "No uses markdown, no uses asteriscos, no pongas titulos de seccion, solo el texto corrido separado por linea en blanco.\n\n"
+        "Datos tecnicos:\n" + tech_summary + "\n"
+        "Noticias recientes:\n" + ticker_news_text,
+        max_tokens=600
     )
  
     lines = []
@@ -278,9 +291,14 @@ def analyze_ticker(symbol):
     lines.append("📊 *Vol promedio 20d:* " + "{:,}".format(vol_avg20) + " (ratio: " + str(vol_ratio) + "x)")
  
     if claude_analysis:
+        parts = claude_analysis.strip().split("\n\n", 1)
         lines.append("")
-        lines.append("*Analisis*")
-        lines.append(claude_analysis)
+        lines.append("*Contexto global*")
+        lines.append(parts[0].strip())
+        if len(parts) > 1:
+            lines.append("")
+            lines.append("*Analisis tecnico*")
+            lines.append(parts[1].strip())
  
     lines.append("")
     lines.append("_ST Capital - No es asesoramiento financiero._")
@@ -570,4 +588,4 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
+
