@@ -979,36 +979,67 @@ def build_close():
     return msg
 
 def build_hourly():
-    now = datetime.now(TZ).strftime("%H:%M hs - %d %b %Y")
+    now  = datetime.now(TZ).strftime("%H:%M hs")
+    hour = datetime.now(TZ).hour
+
     snapshot, indices, crypto, commodities, forex, stocks = build_market_snapshot()
-    news_markets = fetch_news("markets stocks Wall Street economy", 4)
-    news_war     = fetch_news("war conflict geopolitics military crisis", 3)
-    news_usa     = fetch_news("United States economy breaking news", 3)
-    all_news_text = (
-        "Mercados: " + " | ".join(news_markets[:3])
-        + "\nGeopolitica: " + " | ".join(news_war[:3])
-        + "\nUSA: " + " | ".join(news_usa[:3])
+
+    # Fetch broad news from multiple angles
+    news_economy  = fetch_news("economy markets Fed interest rates inflation", 5)
+    news_geo      = fetch_news("geopolitics war conflict military sanctions energy", 5)
+    news_usa      = fetch_news("Trump United States economy trade tariffs", 4)
+    news_energy   = fetch_news("oil gas energy OPEC Middle East", 4)
+    news_finance  = fetch_news("stocks earnings bonds yield Federal Reserve", 4)
+
+    all_headlines = (
+        "ECONOMIA/MERCADOS: " + " | ".join(news_economy[:4]) + "\n"
+        "GEOPOLITICA/GUERRA: " + " | ".join(news_geo[:4]) + "\n"
+        "ESTADOS UNIDOS: " + " | ".join(news_usa[:3]) + "\n"
+        "ENERGIA: " + " | ".join(news_energy[:3]) + "\n"
+        "FINANZAS: " + " | ".join(news_finance[:3])
     )
+
     prompt = (
-        "Sos analista global de ST Capital. Son las " + now + " hora Argentina. "
-        "Resumen horario con 3 secciones (1-2 oraciones c/u, sin titulos ni markdown):\n"
-        "MERCADOS: estado de indices, commodities y cripto.\n"
-        "GEOPOLITICA: conflictos o tensiones mundiales relevantes.\n"
-        "USA: noticia mas trascendente de Estados Unidos ahora.\n\n"
-        "Datos:\n" + snapshot + "\n\nNoticias:\n" + all_news_text
+        "Sos un analista financiero senior de ST Capital. Son las " + now + " hora Argentina.\n\n"
+        "Con las noticias y datos de mercado provistos, redacta un ALERTA DE MERCADO en español "
+        "con este formato EXACTO (sin markdown, sin asteriscos, texto plano):\n\n"
+        "🚨 ALERTA DE MERCADO - " + now + "\n\n"
+        "Que esta pasando:\n"
+        "[2-3 oraciones explicando el evento o dinamica mas relevante del momento. "
+        "Enfocate en lo que realmente mueve mercados: geopolitica, macro, Fed, datos economicos, "
+        "tensiones comerciales, crisis energetica, o cualquier evento de alto impacto. "
+        "Se especifico, nombra paises, funcionarios, datos concretos.]\n\n"
+        "Impacto en mercados:\n"
+        "[2-3 oraciones describiendo como esto afecta indices, commodities, cripto, bonos o acciones especificas. "
+        "Nombra activos concretos que se ven beneficiados y perjudicados. "
+        "Menciona CEDEARs relevantes si aplica.]\n\n"
+        "Que hacer:\n"
+        "[1-2 oraciones con una perspectiva practica para el inversor: "
+        "donde poner atencion, que sectores monitorear, sin dar senales directas de compra/venta.]\n\n"
+        "⚠️ Analisis informativo. No es asesoramiento financiero.\n\n"
+        "---\n"
+        "Datos de mercado actuales:\n" + snapshot + "\n"
+        "Noticias recientes (usa estas como fuente principal):\n" + all_headlines
     )
-    analysis = ask_claude(prompt, max_tokens=500)
-    msg = "🌐 *RESUMEN " + now + "*\n_ST Capital_\n"
+
+    alert = ask_claude(prompt, max_tokens=700)
+
+    # Build message
+    msg = "🚨 *ALERTA DE MERCADO - " + now + "*\n_ST Capital_\n"
     msg += section("📊 *INDICES*", indices)
     msg += section("🛢 *COMMODITIES*", commodities)
     msg += section("🪙 *CRYPTO*", crypto, decimals=0)
-    if analysis:
-        msg += "\n\n" + analysis
-    top_news = news_markets[:1] + news_war[:1] + news_usa[:1]
-    if top_news:
-        msg += "\n\n📰 *Titulares*"
-        for n in top_news:
-            msg += "\n- " + n
+
+    if alert:
+        msg += "\n\n" + alert
+    else:
+        # Fallback if Claude fails
+        top = news_economy[:2] + news_geo[:1] + news_usa[:1]
+        if top:
+            msg += "\n\n📰 *Titulares*"
+            for n in top:
+                msg += "\n- " + n
+
     msg += "\n\n_ST Capital_"
     return msg
 
