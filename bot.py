@@ -466,6 +466,47 @@ def build_close():
     msg += "\n\n_ST Capital - Hasta manana_"
     return msg
  
+ 
+ 
+ 
+def build_hourly():
+    now = datetime.now(TZ).strftime("%H:%M hs - %d %b %Y")
+    snapshot, indices, crypto, commodities, forex, stocks = build_market_snapshot()
+    news_markets = fetch_news("markets stocks Wall Street economy", 4)
+    news_war = fetch_news("war conflict geopolitics military crisis", 3)
+    news_usa = fetch_news("United States economy breaking news", 3)
+ 
+    all_news_text = (
+        "Mercados: " + " | ".join(news_markets[:3])
+        + "\nGeopolitica: " + " | ".join(news_war[:3])
+        + "\nUSA: " + " | ".join(news_usa[:3])
+    )
+ 
+    prompt = (
+        "Sos analista global de ST Capital. Son las " + now + " hora Argentina. "
+        "Escribi un resumen con estas 3 secciones (1-2 oraciones cada una, sin titulos ni markdown):\n"
+        "MERCADOS: estado de indices, commodities y cripto ahora.\n"
+        "GEOPOLITICA: conflictos o tensiones mundiales relevantes.\n"
+        "USA: noticia mas trascendente de Estados Unidos ahora.\n\n"
+        "Datos:\n" + snapshot + "\n\nNoticias:\n" + all_news_text
+    )
+ 
+    analysis = ask_claude(prompt, max_tokens=500)
+ 
+    msg = "🌐 *RESUMEN " + now + "*\n_ST Capital_\n"
+    msg += section("📊 *INDICES*", indices)
+    msg += section("🛢 *COMMODITIES*", commodities)
+    msg += section("🪙 *CRYPTO*", crypto, decimals=0)
+    if analysis:
+        msg += "\n\n" + analysis
+    top_news = news_markets[:1] + news_war[:1] + news_usa[:1]
+    if top_news:
+        msg += "\n\n📰 *Titulares*"
+        for n in top_news:
+            msg += "\n- " + n
+    msg += "\n\n_ST Capital_"
+    return msg
+ 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
  
 APP = None
@@ -518,9 +559,15 @@ def main():
     scheduler.add_job(make_job(build_preclose),   "cron", hour=15, minute=0)
     scheduler.add_job(make_job(build_close),      "cron", hour=17, minute=0)
  
+    scheduled_hours = {9, 11, 13, 15, 17}
+    for h in range(8, 23):
+        if h not in scheduled_hours:
+            scheduler.add_job(make_job(build_hourly), "cron", hour=h, minute=0)
+ 
     scheduler.start()
     logger.info("ST Capital Bot running - Claude AI integrated.")
     APP.run_polling(drop_pending_updates=True)
  
 if __name__ == "__main__":
     main()
+ 
