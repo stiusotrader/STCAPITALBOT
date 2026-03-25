@@ -1,22 +1,21 @@
 import os
 import logging
-import time
 from datetime import datetime
 import pytz
 import numpy as np
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import yfinance as yf
 import requests
  
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
  
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID        = os.environ.get("CHAT_ID")
-NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "")
-TZ             = pytz.timezone("America/Argentina/Buenos_Aires")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID          = os.environ.get("CHAT_ID")
+NEWS_API_KEY     = os.environ.get("NEWS_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+TZ               = pytz.timezone("America/Argentina/Buenos_Aires")
  
 INDICES = {
     "S&P 500":   "^GSPC",
@@ -53,22 +52,16 @@ CRYPTO_IDS = {
     "BNB":      "binancecoin",
 }
  
-# ── Data fetching ─────────────────────────────────────────────────────────────
+# ── Yahoo Finance direct API ──────────────────────────────────────────────────
  
 def get_yahoo_data(symbol, period="1y"):
-    """Fetch historical data using direct Yahoo Finance API call as primary method."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
-    interval = "1d"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     range_map = {"2d": "5d", "1y": "1y"}
     yf_range = range_map.get(period, period)
- 
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=" + interval + "&range=" + yf_range
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=" + yf_range
     try:
-        r    = requests.get(url, headers=headers, timeout=15)
-        data = r.json()
+        r      = requests.get(url, headers=headers, timeout=15)
+        data   = r.json()
         result = data.get("chart", {}).get("result", [])
         if not result:
             return None
@@ -80,31 +73,53 @@ def get_yahoo_data(symbol, period="1y"):
             return None
         return {"closes": closes, "volumes": volumes}
     except Exception as e:
-        logger.warning("Direct YF API error for " + symbol + ": " + str(e))
+        logger.warning("YF API error for " + symbol + ": " + str(e))
         return None
  
 def get_ticker_info(symbol):
-    """Fetch ticker metadata."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/" + symbol + "?modules=assetProfile,summaryDetail,price"
+    url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/" + symbol + "?modules=assetProfile,price"
     try:
-        r    = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
+        r      = requests.get(url, headers=headers, timeout=10)
+        data   = r.json()
         result = data.get("quoteSummary", {}).get("result", [])
         if not result:
             return {}
-        info = {}
-        price_data   = result[0].get("price", {})
-        asset_data   = result[0].get("assetProfile", {})
-        summary_data = result[0].get("summaryDetail", {})
-        info["longName"]   = price_data.get("longName") or price_data.get("shortName", symbol)
-        info["sector"]     = asset_data.get("sector", "")
-        info["industry"]   = asset_data.get("industry", "")
-        info["marketCap"]  = price_data.get("marketCap", {}).get("raw") or summary_data.get("marketCap", {}).get("raw")
-        return info
+        price_data = result[0].get("price", {})
+        asset_data = result[0].get("assetProfile", {})
+        return {
+            "longName":  price_data.get("longName") or price_data.get("shortName", symbol),
+            "sector":    asset_data.get("sector", ""),
+            "industry":  asset_data.get("industry", ""),
+            "marketCap": price_data.get("marketCap", {}).get("raw"),
+        }
     except Exception as e:
-        logger.warning("Ticker info error for " + symbol + ": " + str(e))
+        logger.warning("Ticker info error: " + str(e))
         return {}
+ 
+# ── Claude AI ─────────────────────────────────────────────────────────────────
+ 
+def ask_claude(prompt):
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-haiku-4-5-20251001",
+                "max_tokens": 600,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        data = r.json()
+        return data.get("content", [{}])[0].get("text", "").strip()
+    except Exception as e:
+        logger.error("Claude API error: " + str(e))
+        return ""
  
 # ── Helpers ───────────────────────────────────────────────────────────────────
  
@@ -129,10 +144,10 @@ def fmt_large(val):
     return "${:,.0f}".format(val)
  
 def compute_rsi(closes, period=14):
-    arr     = np.array(closes, dtype=float)
-    deltas  = np.diff(arr)
-    gains   = np.where(deltas > 0, deltas, 0)
-    losses  = np.where(deltas < 0, -deltas, 0)
+    arr      = np.array(closes, dtype=float)
+    deltas   = np.diff(arr)
+    gains    = np.where(deltas > 0, deltas, 0)
+    losses   = np.where(deltas < 0, -deltas, 0)
     avg_gain = np.mean(gains[-period:])
     avg_loss = np.mean(losses[-period:])
     if avg_loss == 0:
@@ -159,16 +174,7 @@ def analyze_ticker(symbol):
  
     data = get_yahoo_data(symbol, "1y")
     if not data or len(data["closes"]) < 20:
-        # Fallback to yfinance
-        try:
-            t    = yf.Ticker(symbol)
-            hist = t.history(period="1y")
-            if hist.empty or len(hist) < 20:
-                return "No encontre datos para " + symbol + ". Verifica que el ticker sea valido (ej: AAPL, BTC-USD, GC=F)"
-            data = {"closes": hist["Close"].tolist(), "volumes": hist["Volume"].tolist()}
-        except Exception as e:
-            logger.error("yfinance fallback error: " + str(e))
-            return "No encontre datos para " + symbol + ". Verifica que el ticker sea valido (ej: AAPL, BTC-USD, GC=F)"
+        return "No encontre datos para " + symbol + ". Verifica que sea un ticker valido (ej: AAPL, BTC-USD, GC=F, SPY)"
  
     closes  = data["closes"]
     volumes = data["volumes"]
@@ -201,9 +207,9 @@ def analyze_ticker(symbol):
         sma50      = round(float(np.mean(closes[-50:])), 2)
         dist_sma50 = pct_from_ma(current, sma50)
  
-    closes_arr = np.array(closes)
-    high_52w   = round(float(np.max(closes_arr)), 2)
-    low_52w    = round(float(np.min(closes_arr)), 2)
+    closes_arr    = np.array(closes)
+    high_52w      = round(float(np.max(closes_arr)), 2)
+    low_52w       = round(float(np.min(closes_arr)), 2)
     dist_52w_high = pct_from_ma(current, high_52w)
     dist_52w_low  = pct_from_ma(current, low_52w)
  
@@ -217,15 +223,26 @@ def analyze_ticker(symbol):
     industry = info.get("industry", "")
     mktcap   = info.get("marketCap")
  
-    news_headlines = []
-    if NEWS_API_KEY:
-        try:
-            url      = "https://newsapi.org/v2/everything?q=" + symbol + "&language=en&sortBy=publishedAt&pageSize=3&apiKey=" + NEWS_API_KEY
-            r        = requests.get(url, timeout=8)
-            articles = r.json().get("articles", [])
-            news_headlines = [a["title"] for a in articles if a.get("title")][:3]
-        except Exception:
-            pass
+    # Build technical summary for Claude
+    tech_summary = (
+        "Activo: " + name + " (" + symbol + ")\n"
+        "Precio actual: $" + fmt_price(current) + " (" + "{:+.2f}".format(day_chg) + "% hoy)\n"
+        + ("RSI 14: " + str(rsi) + "\n" if rsi else "")
+        + ("RS Score vs SPY: " + "{:+.2f}".format(rs_score) + "%\n" if rs_score is not None else "")
+        + ("Distancia EMA 200: " + "{:+.2f}".format(dist_ema200) + "%\n" if dist_ema200 is not None else "")
+        + ("Distancia SMA 50: " + "{:+.2f}".format(dist_sma50) + "%\n" if dist_sma50 is not None else "")
+        + "MAX 52W: $" + fmt_price(high_52w) + " (" + "{:+.2f}".format(dist_52w_high) + "% del maximo)\n"
+        + "MIN 52W: $" + fmt_price(low_52w) + "\n"
+        + "Volumen ratio vs 20d: " + str(vol_ratio) + "x\n"
+    )
+ 
+    claude_analysis = ask_claude(
+        "Sos un analista financiero experto. Con los siguientes datos tecnicos de " + name + ", "
+        "escribi un analisis breve (3-4 oraciones) en español sobre el estado actual del activo, "
+        "destacando lo mas relevante para un trader. Se directo, concreto y profesional. "
+        "No uses markdown, no uses asteriscos, no uses guiones al inicio.\n\n"
+        + tech_summary
+    )
  
     lines = []
     lines.append("*" + name + "* (" + symbol + ")")
@@ -260,19 +277,18 @@ def analyze_ticker(symbol):
     lines.append(vol_emoji + " *Vol ultimo dia:* " + "{:,}".format(vol_last))
     lines.append("📊 *Vol promedio 20d:* " + "{:,}".format(vol_avg20) + " (ratio: " + str(vol_ratio) + "x)")
  
-    if news_headlines:
+    if claude_analysis:
         lines.append("")
-        lines.append("*Ultimas noticias*")
-        for h in news_headlines:
-            lines.append("- " + h)
+        lines.append("*Analisis*")
+        lines.append(claude_analysis)
  
     lines.append("")
     lines.append("_ST Capital - No es asesoramiento financiero._")
     return "\n".join(lines)
  
-# ── Market data for scheduled messages ───────────────────────────────────────
+# ── Market data ───────────────────────────────────────────────────────────────
  
-def fetch_yf_simple(symbols):
+def fetch_market(symbols, decimals=2):
     results = {}
     for name, ticker in symbols.items():
         data = get_yahoo_data(ticker, "2d")
@@ -311,61 +327,142 @@ def section(title, data, decimals=2):
         lines.append(arrow_emoji(v["change"]) + " *" + name + "*: $" + fmt_price(v["price"], decimals) + "  (" + "{:+.2f}".format(v["change"]) + "%)")
     return "\n".join(lines)
  
-# ── Message builders ──────────────────────────────────────────────────────────
+def build_market_snapshot():
+    indices     = fetch_market(INDICES)
+    crypto      = fetch_crypto()
+    commodities = fetch_market(COMMODITIES)
+    forex       = fetch_market(FOREX)
+    stocks      = fetch_market(US_STOCKS)
+ 
+    snapshot = "INDICES GLOBALES:\n"
+    for name, v in indices.items():
+        snapshot += name + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+    snapshot += "\nCRYPTO:\n"
+    for name, v in crypto.items():
+        snapshot += name + ": $" + fmt_price(v["price"], 0) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+    snapshot += "\nCOMMODITIES:\n"
+    for name, v in commodities.items():
+        snapshot += name + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+    snapshot += "\nFOREX:\n"
+    for name, v in forex.items():
+        snapshot += name + ": " + fmt_price(v["price"], 4) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+    snapshot += "\nUS STOCKS:\n"
+    for name, v in stocks.items():
+        snapshot += name + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+    return snapshot, indices, crypto, commodities, forex, stocks
+ 
+# ── Scheduled message builders ────────────────────────────────────────────────
  
 def build_opening():
     now = datetime.now(TZ).strftime("%A %d %b %Y")
-    msg = "🌅 *APERTURA - ST Capital*\n_" + now + "_\n"
-    msg += section("📊 *INDICES GLOBALES*", fetch_yf_simple(INDICES))
-    msg += section("🪙 *CRYPTO*", fetch_crypto(), decimals=0)
-    msg += section("🛢 *COMMODITIES*", fetch_yf_simple(COMMODITIES))
+    snapshot, indices, crypto, commodities, _, _ = build_market_snapshot()
     news = fetch_news("markets stocks economy", 4)
+ 
+    news_text = ""
+    if news:
+        news_text = "\nNoticias destacadas del dia:\n" + "\n".join(["- " + n for n in news[:4]])
+ 
+    analysis = ask_claude(
+        "Sos un analista financiero experto de ST Capital. Hoy es " + now + ". "
+        "Con los siguientes datos de mercado al inicio del dia, escribi un analisis de apertura "
+        "de 4-5 oraciones en español. Destaca las tendencias mas importantes, que activos lideran "
+        "o rezagan, y que deberia monitorear un trader hoy. Se directo y profesional. Sin markdown.\n\n"
+        + snapshot + news_text
+    )
+ 
+    msg = "🌅 *APERTURA - ST Capital*\n_" + now + "_\n"
+    msg += section("📊 *INDICES GLOBALES*", indices)
+    msg += section("🪙 *CRYPTO*", crypto, decimals=0)
+    msg += section("🛢 *COMMODITIES*", commodities)
     if news:
         msg += "\n\n📰 *NOTICIAS*"
-        for n in news[:4]: msg += "\n- " + n
+        for n in news[:3]: msg += "\n- " + n
+    if analysis:
+        msg += "\n\n*Analisis de apertura*\n" + analysis
     msg += "\n\n_ST Capital_"
     return msg
  
 def build_midmorning():
-    msg = "📊 *MID-MORNING - ST Capital*\n"
-    msg += section("📈 *INDICES*", fetch_yf_simple(INDICES))
-    msg += section("🏢 *US STOCKS*", fetch_yf_simple(US_STOCKS))
+    snapshot, indices, _, _, _, stocks = build_market_snapshot()
     news = fetch_news("stock market Wall Street", 3)
+ 
+    analysis = ask_claude(
+        "Sos un analista de ST Capital. Con estos datos de mercado a media manana, "
+        "escribi un update breve de 3 oraciones en español sobre como esta yendo la sesion "
+        "y que sectores o activos merecen atencion. Sin markdown.\n\n" + snapshot
+    )
+ 
+    msg = "📊 *MID-MORNING - ST Capital*\n"
+    msg += section("📈 *INDICES*", indices)
+    msg += section("🏢 *US STOCKS*", stocks)
     if news:
         msg += "\n\n📰 *NOTICIAS*"
         for n in news[:3]: msg += "\n- " + n
+    if analysis:
+        msg += "\n\n*Update*\n" + analysis
     msg += "\n\n_ST Capital_"
     return msg
  
 def build_midday():
+    snapshot, _, crypto, commodities, forex, _ = build_market_snapshot()
+    news = fetch_news("commodity oil gold forex macro", 3)
+ 
+    analysis = ask_claude(
+        "Sos un analista de ST Capital. Con estos datos de mercado al mediodia, "
+        "escribi un analisis de 3 oraciones en español enfocado en commodities, forex y crypto. "
+        "Que narrativa macro domina? Sin markdown.\n\n" + snapshot
+    )
+ 
     msg = "🔴 *MEDIODIA - ST Capital*\n"
-    msg += section("🛢 *COMMODITIES*", fetch_yf_simple(COMMODITIES))
-    msg += section("💱 *FOREX*", fetch_yf_simple(FOREX), decimals=4)
-    msg += section("🪙 *CRYPTO*", fetch_crypto(), decimals=0)
-    news = fetch_news("commodity oil gold forex", 3)
+    msg += section("🛢 *COMMODITIES*", commodities)
+    msg += section("💱 *FOREX*", forex, decimals=4)
+    msg += section("🪙 *CRYPTO*", crypto, decimals=0)
     if news:
         msg += "\n\n📰 *NOTICIAS*"
         for n in news[:3]: msg += "\n- " + n
+    if analysis:
+        msg += "\n\n*Analisis macro*\n" + analysis
     msg += "\n\n_ST Capital_"
     return msg
  
 def build_preclose():
+    snapshot, indices, _, _, _, stocks = build_market_snapshot()
+    news = fetch_news("earnings stocks Wall Street close", 3)
+ 
+    analysis = ask_claude(
+        "Sos un analista de ST Capital. Faltan 2 horas para el cierre de Wall Street. "
+        "Con estos datos, escribi un analisis de 3 oraciones en español sobre como se perfila "
+        "el cierre y que niveles o activos son clave monitorear. Sin markdown.\n\n" + snapshot
+    )
+ 
     msg = "📈 *PRE-CIERRE USA - ST Capital*\n"
-    msg += section("🏢 *US STOCKS*", fetch_yf_simple(US_STOCKS))
-    msg += section("📊 *INDICES USA*", fetch_yf_simple({"S&P 500": "^GSPC", "Nasdaq": "^IXIC", "Dow Jones": "^DJI"}))
-    news = fetch_news("earnings stocks Wall Street", 3)
+    msg += section("🏢 *US STOCKS*", stocks)
+    msg += section("📊 *INDICES USA*", {k: v for k, v in indices.items() if k in ["S&P 500", "Nasdaq", "Dow Jones"]})
     if news:
         msg += "\n\n📰 *NOTICIAS*"
         for n in news[:3]: msg += "\n- " + n
+    if analysis:
+        msg += "\n\n*Analisis pre-cierre*\n" + analysis
     msg += "\n\n_ST Capital_"
     return msg
  
 def build_close():
+    snapshot, indices, crypto, commodities, _, stocks = build_market_snapshot()
+ 
+    analysis = ask_claude(
+        "Sos un analista de ST Capital. El mercado acaba de cerrar. "
+        "Con estos datos del cierre, escribi un resumen del dia de 4-5 oraciones en español. "
+        "Que movimientos fueron mas relevantes? Que contexto deja para manana? Sin markdown.\n\n"
+        + snapshot
+    )
+ 
     msg = "🌙 *CIERRE DEL DIA - ST Capital*\n"
-    msg += section("📊 *INDICES*", fetch_yf_simple(INDICES))
-    msg += section("🏢 *US STOCKS*", fetch_yf_simple(US_STOCKS))
-    msg += section("🛢 *COMMODITIES*", fetch_yf_simple(COMMODITIES))
-    msg += section("🪙 *CRYPTO*", fetch_crypto(), decimals=0)
+    msg += section("📊 *INDICES*", indices)
+    msg += section("🏢 *US STOCKS*", stocks)
+    msg += section("🛢 *COMMODITIES*", commodities)
+    msg += section("🪙 *CRYPTO*", crypto, decimals=0)
+    if analysis:
+        msg += "\n\n*Resumen del dia*\n" + analysis
     msg += "\n\n_ST Capital - Hasta manana_"
     return msg
  
@@ -383,7 +480,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = text.upper().replace(" ", "").lstrip("/")
  
     if symbol in ["START", "HELP", "AYUDA"]:
-        await update.message.reply_text("ST Capital Bot\n\nEscribime cualquier ticker:\nAAPL, BTC-USD, GC=F, SPY, TSLA, ETH-USD, ^GSPC...")
+        await update.message.reply_text(
+            "ST Capital Bot\n\nEscribime cualquier ticker:\nAAPL, BTC-USD, GC=F, SPY, TSLA, ETH-USD, ^GSPC..."
+        )
         return
  
     await update.message.reply_text("Analizando " + symbol + "...")
@@ -411,7 +510,7 @@ def main():
                     APP.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown", disable_web_page_preview=True),
                     APP.update_queue._loop
                 )
-                future.result(timeout=30)
+                future.result(timeout=60)
             except Exception as e:
                 logger.error("Job error: " + str(e))
         return job
@@ -423,7 +522,7 @@ def main():
     scheduler.add_job(make_job(build_close),      "cron", hour=17, minute=0)
  
     scheduler.start()
-    logger.info("ST Capital Bot running - scheduled + on-demand active.")
+    logger.info("ST Capital Bot running - Claude AI integrated.")
     APP.run_polling(drop_pending_updates=True)
  
 if __name__ == "__main__":
