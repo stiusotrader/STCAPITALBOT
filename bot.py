@@ -21,6 +21,7 @@ TZ                = pytz.timezone("America/Argentina/Buenos_Aires")
 # ── Asset maps ────────────────────────────────────────────────────────────────
 
 TICKER_ALIASES = {
+    # Commodities
     "BRENT": "BZ=F", "WTI": "CL=F", "OIL": "CL=F",
     "PETROLEO": "CL=F", "PETRÓLEO": "CL=F",
     "GOLD": "GC=F", "ORO": "GC=F",
@@ -29,6 +30,37 @@ TICKER_ALIASES = {
     "SOJA": "ZS=F", "SOY": "ZS=F",
     "COBRE": "HG=F", "COPPER": "HG=F",
     "CORN": "ZC=F", "WHEAT": "ZW=F",
+    # Forex — both formats
+    "EURUSD":  "EURUSD=X", "EUR/USD": "EURUSD=X", "EUR":     "EURUSD=X",
+    "GBPUSD":  "GBPUSD=X", "GBP/USD": "GBPUSD=X", "GBP":     "GBPUSD=X",
+    "USDJPY":  "USDJPY=X", "USD/JPY": "USDJPY=X", "JPY":     "USDJPY=X",
+    "AUDUSD":  "AUDUSD=X", "AUD/USD": "AUDUSD=X", "AUD":     "AUDUSD=X",
+    "USDCHF":  "USDCHF=X", "USD/CHF": "USDCHF=X", "CHF":     "USDCHF=X",
+    "USDCAD":  "USDCAD=X", "USD/CAD": "USDCAD=X", "CAD":     "USDCAD=X",
+    "NZDUSD":  "NZDUSD=X", "NZD/USD": "NZDUSD=X", "NZD":     "NZDUSD=X",
+    # Latam
+    "USDBRL":  "USDBRL=X", "USD/BRL": "USDBRL=X", "BRL":     "USDBRL=X", "REAL": "USDBRL=X",
+    "USDMXN":  "USDMXN=X", "USD/MXN": "USDMXN=X", "MXN":     "USDMXN=X", "PESO": "USDMXN=X",
+    "USDCLP":  "USDCLP=X", "USD/CLP": "USDCLP=X", "CLP":     "USDCLP=X",
+    "USDCOP":  "USDCOP=X", "USD/COP": "USDCOP=X", "COP":     "USDCOP=X",
+    "USDARS":  "ARS=X",    "USD/ARS": "ARS=X",    "ARS":     "ARS=X",
+    # DXY
+    "DXY":     "DX-Y.NYB", "DOLAR":   "DX-Y.NYB", "DOLLAR":  "DX-Y.NYB",
+}
+
+# Forex tickers set for special analysis routing
+FOREX_TICKERS = {
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCHF=X",
+    "USDCAD=X", "NZDUSD=X", "USDBRL=X", "USDMXN=X", "USDCLP=X",
+    "USDCOP=X", "ARS=X", "DX-Y.NYB",
+}
+
+FOREX_NAMES = {
+    "EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD", "USDJPY=X": "USD/JPY",
+    "AUDUSD=X": "AUD/USD", "USDCHF=X": "USD/CHF", "USDCAD=X": "USD/CAD",
+    "NZDUSD=X": "NZD/USD", "USDBRL=X": "USD/BRL", "USDMXN=X": "USD/MXN",
+    "USDCLP=X": "USD/CLP", "USDCOP=X": "USD/COP", "ARS=X":    "USD/ARS",
+    "DX-Y.NYB": "DXY (Indice Dolar)",
 }
 
 INDICES = {
@@ -590,12 +622,112 @@ def analyze_cedear(symbol):
     lines.append("_ST Capital - No es asesoramiento financiero._")
     return "\n".join(lines)
 
+# ── Forex analyzer ───────────────────────────────────────────────────────────
+
+def analyze_forex(symbol):
+    """Full forex analysis with context and technicals."""
+    pair_name = FOREX_NAMES.get(symbol, symbol)
+    data = get_yahoo_data(symbol, "1y")
+    if not data or len(data["closes"]) < 5:
+        return "No encontre datos para *" + pair_name + "*. Intenta de nuevo."
+
+    closes  = data["closes"]
+    current = closes[-1]
+    prev    = closes[-2] if len(closes) >= 2 else current
+    day_chg = ((current - prev) / prev) * 100
+
+    rsi = compute_rsi(closes) if len(closes) >= 16 else None
+
+    sma50 = dist_sma50 = None
+    if len(closes) >= 50:
+        sma50      = round(float(np.mean(closes[-50:])), 2)
+        dist_sma50 = pct_from_ma(current, sma50)
+
+    ema200 = dist_ema200 = None
+    if len(closes) >= 200:
+        ema = closes[0]
+        k   = 2 / 201
+        for c in closes:
+            ema = c * k + ema * (1 - k)
+        ema200      = round(float(ema), 4)
+        dist_ema200 = pct_from_ma(current, ema200)
+
+    arr      = np.array(closes)
+    high_52w = round(float(np.max(arr)), 4)
+    low_52w  = round(float(np.min(arr)), 4)
+    dist_52h = pct_from_ma(current, high_52w)
+    dist_52l = pct_from_ma(current, low_52w)
+
+    # Determine decimals based on pair
+    dec = 2 if "JPY" in symbol or "CLP" in symbol or "COP" in symbol or "ARS" in symbol else 4
+
+    tech = (
+        "Par: " + pair_name + "\n"
+        "Precio actual: " + fmt_price(current, dec) + " (" + "{:+.2f}".format(day_chg) + "% hoy)\n"
+        + ("RSI 14: " + str(rsi) + "\n" if rsi else "")
+        + ("Dist SMA50: " + "{:+.2f}".format(dist_sma50) + "%\n" if dist_sma50 is not None else "")
+        + ("Dist EMA200: " + "{:+.2f}".format(dist_ema200) + "%\n" if dist_ema200 is not None else "")
+        + "MAX 52W: " + fmt_price(high_52w, dec) + " (" + "{:+.2f}".format(dist_52h) + "%)\n"
+        + "MIN 52W: " + fmt_price(low_52w, dec) + "\n"
+    )
+
+    analysis = ask_claude(
+        "Sos analista de forex de ST Capital. Analiza el par " + pair_name + ".\n\n"
+        "Dos parrafos separados por linea en blanco:\n\n"
+        "PARRAFO 1 - CONTEXTO MACRO (3 oraciones): que bancos centrales influyen, "
+        "que variables macro (tasas, inflacion, crecimiento, geopolitica) mueven este par hoy.\n\n"
+        "PARRAFO 2 - ANALISIS TECNICO (3 oraciones): tendencia actual, niveles clave, "
+        "que dicen RSI y medias moviles, conclusion del momento.\n\n"
+        "Sin markdown, sin asteriscos, sin titulos.\n\n"
+        "Datos:\n" + tech,
+        max_tokens=600
+    )
+
+    lines = ["*" + pair_name + "* (Forex) 💱", ""]
+    lines.append(arrow_emoji(day_chg) + " *Precio:* " + fmt_price(current, dec) +
+                 "  " + "{:+.2f}".format(day_chg) + "%")
+    lines.append("")
+    lines.append("*Indicadores tecnicos*")
+    if rsi is not None:
+        tag = " - Sobrecomprado" if rsi >= 70 else (" - Sobrevendido" if rsi <= 30 else "")
+        lines.append("📉 *RSI 14:* " + str(rsi) + tag)
+    if sma50 is not None:
+        lines.append(arrow_emoji(dist_sma50) + " *Dist SMA 50:* " +
+                     "{:+.2f}".format(dist_sma50) + "% (SMA: " + fmt_price(sma50, dec) + ")")
+    if ema200 is not None:
+        lines.append(arrow_emoji(dist_ema200) + " *Dist EMA 200:* " +
+                     "{:+.2f}".format(dist_ema200) + "% (EMA: " + fmt_price(ema200, dec) + ")")
+    lines.append("")
+    lines.append("*52W Range*")
+    lines.append("📈 *MAX 52W:* " + fmt_price(high_52w, dec) +
+                 "  (" + "{:+.2f}".format(dist_52h) + "% del maximo)")
+    lines.append("📉 *MIN 52W:* " + fmt_price(low_52w, dec) +
+                 "  (" + "{:+.2f}".format(dist_52l) + "% del minimo)")
+
+    if analysis:
+        parts = analysis.strip().split("\n\n", 1)
+        lines.append("")
+        lines.append("*Contexto macro*")
+        lines.append(parts[0].strip())
+        if len(parts) > 1:
+            lines.append("")
+            lines.append("*Analisis tecnico*")
+            lines.append(parts[1].strip())
+
+    lines.append("")
+    lines.append("_ST Capital - No es asesoramiento financiero._")
+    return "\n".join(lines)
+
 # ── Global ticker analyzer ────────────────────────────────────────────────────
 
 def analyze_ticker(symbol):
     symbol = symbol.upper().strip()
     symbol = TICKER_ALIASES.get(symbol, symbol)
     logger.info("Analyzing: " + symbol)
+
+    # Route forex pairs
+    if symbol in FOREX_TICKERS:
+        return analyze_forex(symbol)
 
     ar_type = detect_ar_asset_type(symbol)
     if ar_type == "dolar_ar":   return analyze_ar_dolar()
