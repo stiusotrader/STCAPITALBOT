@@ -956,6 +956,113 @@ def build_close():
     msg += "\n\n_ST Capital - Hasta manana_"
     return msg
 
+def build_8am():
+    """Special 8am morning briefing with full structure like a premium newsletter."""
+    now     = datetime.now(TZ)
+    fecha   = now.strftime("%d/%m/%Y")
+    hora    = now.strftime("%H:%M hs")
+
+    # Fetch all data
+    snap, indices, crypto, commodities, forex, stocks = build_market_snapshot()
+    dolar       = get_dolar()
+    news_geo    = fetch_news("geopolitics war conflict sanctions Middle East", 5)
+    news_macro  = fetch_news("Fed interest rates economy inflation GDP", 4)
+    news_ar     = fetch_news("Argentina Merval economia bonos Milei", 4)
+    news_agenda = fetch_news("earnings economic data release today", 4)
+
+    dolar_str = " | ".join(n + ": $" + str(v.get("venta","")) for n, v in dolar.items())
+
+    # Build data snapshot for Claude
+    indices_str = ""
+    for n, v in indices.items():
+        indices_str += n + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+
+    commodities_str = ""
+    for n, v in commodities.items():
+        commodities_str += n + ": $" + fmt_price(v["price"]) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+
+    crypto_str = ""
+    for n, v in crypto.items():
+        crypto_str += n + ": $" + fmt_price(v["price"], 0) + " (" + "{:+.2f}".format(v["change"]) + "%)\n"
+
+    all_news = (
+        "GEOPOLITICA: " + " | ".join(news_geo[:4]) + "\n"
+        "MACRO/FED: " + " | ".join(news_macro[:3]) + "\n"
+        "ARGENTINA: " + " | ".join(news_ar[:3]) + "\n"
+        "AGENDA: " + " | ".join(news_agenda[:3])
+    )
+
+    # Ask Claude for the full structured analysis
+    analysis = ask_claude(
+        "Sos el analista jefe de ST Capital. Es la manana del " + fecha + " a las " + hora + " hora Argentina.\n\n"
+        "Redacta el BRIEFING MATINAL completo en español para traders e inversores argentinos. "
+        "Usa EXACTAMENTE esta estructura (texto plano, sin markdown, sin asteriscos):\n\n"
+
+        "TITULAR:\n"
+        "[Un titular periodistico impactante de 1 linea que capture el driver principal del dia]\n\n"
+
+        "SESION ASIATICA Y EUROPEA:\n"
+        "[2-3 oraciones sobre como cerraron Asia y como esta Europa. Nombra indices especificos con variaciones. "
+        "Explica el driver principal.]\n\n"
+
+        "TASAS Y DOLAR:\n"
+        "[2 oraciones sobre el T-Note 10Y, DXY y que implica para emergentes y Argentina.]\n\n"
+
+        "LO QUE DEJO AYER EN ARGENTINA:\n"
+        "[2 oraciones sobre el Merval, bonos y contexto local argentino de ayer. "
+        "Menciona acciones o sectores relevantes.]\n\n"
+
+        "AGENDA DEL DIA:\n"
+        "[2 oraciones sobre eventos macro, balances o datos importantes de hoy. "
+        "Si no hay eventos de peso, decilo y explica que va a mover el mercado.]\n\n"
+
+        "LAS 3 CLAVES DE HOY:\n"
+        "1. [Emoji + activo o tema] — [nombre del activo]\n"
+        "[2 oraciones explicando por que importa hoy y que activos concretos mirar. Menciona tickers.]\n\n"
+        "2. [Emoji + activo o tema] — [nombre del activo]\n"
+        "[2 oraciones]\n\n"
+        "3. [Emoji + activo o tema] — [nombre del activo]\n"
+        "[2 oraciones]\n\n"
+
+        "FRASE DEL DIA:\n"
+        "[Una frase celebre real de un inversor o economista famoso, con su autor]\n\n"
+
+        "CIERRE:\n"
+        "[1-2 oraciones de cierre motivador conectando la frase con el contexto del dia]\n\n"
+
+        "Usa los datos reales provistos. Se especifico con precios y porcentajes reales.\n\n"
+        "=== DATOS EN TIEMPO REAL ===\n"
+        "INDICES:\n" + indices_str +
+        "COMMODITIES:\n" + commodities_str +
+        "CRYPTO:\n" + crypto_str +
+        "DOLAR AR: " + dolar_str + "\n\n"
+        "=== NOTICIAS ===\n" + all_news,
+        max_tokens=1200
+    )
+
+    # Build the message
+    msg = "🌅 *BUENOS DÍAS — " + fecha + "*\n_ST Capital_\n"
+    msg += section("\n📊 *INDICES*", indices)
+    msg += section("\n🛢 *COMMODITIES*", commodities)
+    msg += section("\n🪙 *CRYPTO*", crypto, decimals=0)
+    msg += section("\n💱 *DOLAR ARGENTINA*", {
+        n: {"price": float(str(v.get("venta", 0)).replace(",", ".")), "change": 0}
+        for n, v in dolar.items() if v.get("venta")
+    })
+
+    if analysis:
+        msg += "\n\n" + analysis
+    else:
+        # Fallback
+        top = news_geo[:1] + news_macro[:1] + news_ar[:1]
+        if top:
+            msg += "\n\n📰 *Titulares*"
+            for n in top: msg += "\n- " + n
+
+    msg += "\n\n⚠️ _Analisis informativo. No es asesoramiento financiero._"
+    msg += "\n_ST Capital_"
+    return msg
+
 def build_hourly():
     now  = datetime.now(TZ).strftime("%H:%M hs")
     snap, indices, crypto, commodities, _, _ = build_market_snapshot()
@@ -977,14 +1084,13 @@ def build_hourly():
         "con este formato exacto (texto plano, sin markdown):\n\n"
         "🚨 ALERTA DE MERCADO - " + now + "\n\n"
         "Que esta pasando:\n"
-        "[2-3 oraciones sobre el evento mas relevante del momento con datos concretos]\n\n"
+        "[2-3 oraciones sobre el evento mas relevante con datos concretos]\n\n"
         "Impacto en mercados:\n"
-        "[2-3 oraciones sobre como afecta indices, commodities, cripto, acciones especificas]\n\n"
+        "[2-3 oraciones sobre activos beneficiados y perjudicados, tickers especificos]\n\n"
         "Que hacer:\n"
-        "[1-2 oraciones de perspectiva practica para el inversor]\n\n"
+        "[1-2 oraciones de perspectiva practica]\n\n"
         "⚠️ Analisis informativo. No es asesoramiento financiero.\n\n"
-        "Datos de mercado:\n" + snap + "\n"
-        "Noticias:\n" + all_news,
+        "Datos:\n" + snap + "\nNoticias:\n" + all_news,
         max_tokens=650
     )
 
@@ -1086,8 +1192,12 @@ def main():
     scheduler.add_job(make_job(build_preclose),   "cron", hour=15, minute=0)
     scheduler.add_job(make_job(build_close),      "cron", hour=17, minute=0)
 
-    scheduled_hours = {9, 11, 13, 15, 17}
-    for h in range(8, 23):
+    # 8am = special morning briefing
+    scheduler.add_job(make_job(build_8am), "cron", hour=8, minute=0)
+
+    # All other hours = hourly alert
+    scheduled_hours = {8, 9, 11, 13, 15, 17}
+    for h in range(9, 23):
         if h not in scheduled_hours:
             scheduler.add_job(make_job(build_hourly), "cron", hour=h, minute=0)
 
