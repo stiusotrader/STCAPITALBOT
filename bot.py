@@ -18,6 +18,27 @@ NEWS_API_KEY      = os.environ.get("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TZ                = pytz.timezone("America/Argentina/Buenos_Aires")
 
+# ── User registry ─────────────────────────────────────────────────────────────
+# Persists chat IDs to a file so they survive redeploys
+USERS_FILE = "/tmp/stcapital_users.txt"
+
+def load_users():
+    try:
+        with open(USERS_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+def save_user(chat_id):
+    users = load_users()
+    cid   = str(chat_id)
+    if cid not in users:
+        users.add(cid)
+        with open(USERS_FILE, "w") as f:
+            for u in users:
+                f.write(u + "\n")
+        logger.info("New user registered: " + cid + " | Total: " + str(len(users)))
+
 # ── Asset maps ────────────────────────────────────────────────────────────────
 
 TICKER_ALIASES = {
@@ -1117,7 +1138,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     import asyncio
-    text = update.message.text.strip()
+    text    = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    save_user(chat_id)
 
     if text.upper().lstrip("/") in ["START", "HELP", "AYUDA"]:
         await update.message.reply_text(
@@ -1173,15 +1196,24 @@ def main():
         def job():
             import asyncio
             try:
-                text   = fn()
-                future = asyncio.run_coroutine_threadsafe(
-                    APP.bot.send_message(
-                        chat_id=CHAT_ID, text=text,
-                        parse_mode="Markdown", disable_web_page_preview=True
-                    ),
-                    APP.update_queue._loop
-                )
-                future.result(timeout=60)
+                text  = fn()
+                users = load_users()
+                # Always include owner
+                if str(CHAT_ID) not in users:
+                    users.add(str(CHAT_ID))
+                logger.info("Broadcasting to " + str(len(users)) + " users...")
+                for uid in users:
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(
+                            APP.bot.send_message(
+                                chat_id=int(uid), text=text,
+                                parse_mode="Markdown", disable_web_page_preview=True
+                            ),
+                            APP.update_queue._loop
+                        )
+                        future.result(timeout=30)
+                    except Exception as e:
+                        logger.warning("Failed to send to " + uid + ": " + str(e))
             except Exception as e:
                 logger.error("Job error: " + str(e))
         return job
