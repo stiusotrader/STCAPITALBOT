@@ -19,25 +19,47 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TZ                = pytz.timezone("America/Argentina/Buenos_Aires")
 
 # ── User registry ─────────────────────────────────────────────────────────────
-# Persists chat IDs to a file so they survive redeploys
-USERS_FILE = "/tmp/stcapital_users.txt"
+# Uses Railway persistent volume OR environment variable as fallback
+USERS_FILE = "/data/stcapital_users.txt"
 
 def load_users():
+    users = set()
+    # Source 1: persistent file (Railway volume)
     try:
         with open(USERS_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
+            for line in f:
+                uid = line.strip()
+                if uid:
+                    users.add(uid)
     except FileNotFoundError:
-        return set()
+        pass
+    # Source 2: EXTRA_USERS env var (comma separated, set manually in Railway)
+    extra = os.environ.get("EXTRA_USERS", "")
+    for uid in extra.split(","):
+        uid = uid.strip()
+        if uid:
+            users.add(uid)
+    # Always include owner
+    if CHAT_ID:
+        users.add(str(CHAT_ID))
+    return users
 
 def save_user(chat_id):
-    users = load_users()
     cid   = str(chat_id)
-    if cid not in users:
-        users.add(cid)
+    users = load_users()
+    if cid in users:
+        return
+    users.add(cid)
+    # Try to persist to file
+    try:
+        import os as _os
+        _os.makedirs(_os.path.dirname(USERS_FILE), exist_ok=True)
         with open(USERS_FILE, "w") as f:
             for u in users:
                 f.write(u + "\n")
-        logger.info("New user registered: " + cid + " | Total: " + str(len(users)))
+    except Exception as e:
+        logger.warning("Could not save users file: " + str(e))
+    logger.info("New user registered: " + cid + " | Total: " + str(len(users)))
 
 # ── Asset maps ────────────────────────────────────────────────────────────────
 
